@@ -1,0 +1,14 @@
+Packaged/
+Generated/
+Intermediate/
+Build/
+
+# Belt-and-suspenders for the PSP build target: even if a tool drops *.o /
+# *.d / *.elf in the project root (e.g. someone runs `make -C .` directly
+# instead of the addon's GetCompileCommand), git won't pick them up.
+*.o
+*.d
+*.elf
+*.pbp
+*.PBP
+*.SFO

@@ -1,0 +1,284 @@
+# Makefile_PS2 — Polyphase PS2 build, Phase 0-2 (engine compiles + boots).
+#
+# Single-pass build: compiles the engine source tree + PS2 addon runtime +
+# the project's own source into one .elf. Mirrors Makefile_PSP layout,
+# swapping PSPSDK + sceGu for PS2SDK + gsKit.
+#
+# Run via the editor's PS2 build-target addon (which invokes natively on
+# Windows + Linux + macOS, or routes through WSL on Windows when the user
+# checks the 'Use WSL' Target Option), OR manually:
+#
+#   make -C <projectDir>/Intermediate/PS2 -f <addonDir>/Makefile_PS2 \
+#        PROJECT_ROOT=<projectDir> POLYPHASE_PATH=<engineDir> -j4
+
+.DELETE_ON_ERROR:
+
+# PROJECT_ROOT — absolute path to the user's project (where .octp / Source/ /
+# Generated/ / Packages/ live). Resolution priority:
+#   1. Set on the make command line by the PS2 addon's GetCompileCommand
+#      (the normal path). Make runs from $(PROJECT_ROOT)/Intermediate/PS2/ so
+#      all .o/.d/.elf intermediates land there.
+#   2. Walk-up from $(CURDIR) looking for a *.octp file (the project marker).
+ifeq ($(origin PROJECT_ROOT), undefined)
+PROJECT_ROOT := $(strip \
+    $(if $(wildcard $(CURDIR)/*.octp),         $(CURDIR), \
+    $(if $(wildcard $(CURDIR)/../*.octp),      $(abspath $(CURDIR)/..), \
+    $(if $(wildcard $(CURDIR)/../../*.octp),   $(abspath $(CURDIR)/../..), \
+                                                ))))
+endif
+
+ifeq ($(strip $(PROJECT_ROOT)),)
+$(error Could not locate project root — no *.octp file found within 2 levels \
+  of $(CURDIR). Either pass PROJECT_ROOT=/path/to/project on the make line, \
+  or invoke make from your project's root directory or its Intermediate/PS2/ \
+  subdirectory.)
+endif
+
+# Normalise: strip trailing slash. GNU make's $(notdir foo/) returns empty so a
+# trailing-slash PROJECT_ROOT yields TARGET="" → link fails silently as ".elf".
+# `override` is REQUIRED because PROJECT_ROOT is usually set on the make line;
+# GNU make silently ignores plain `:=` reassignment of command-line vars.
+override PROJECT_ROOT := $(patsubst %/,%,$(PROJECT_ROOT))
+
+ifeq ($(wildcard $(PROJECT_ROOT)/*.octp),)
+$(error Resolved PROJECT_ROOT='$(PROJECT_ROOT)' but it has no *.octp file. \
+  The walk-up heuristic found a non-project directory. Pass PROJECT_ROOT \
+  explicitly on the make line.)
+endif
+
+TARGET = $(notdir $(PROJECT_ROOT))
+
+# ---- Engine + addon paths ---------------------------------------------------
+# POLYPHASE_PATH resolution:
+#   1. Set on the make command line by the PS2 addon's GetCompileCommand.
+#   2. Set in the environment.
+#   3. Walk-up from $(PROJECT_ROOT) looking for Polyphase.sln.
+#   4. /opt/Polyphase as a last-resort default.
+POLYPHASE_PATH ?= $(shell \
+    p=$(PROJECT_ROOT); \
+    for i in 1 2 3 4 5 6; do \
+        p=$$(dirname $$p); \
+        if [ -f $$p/Polyphase.sln ]; then echo $$p; exit 0; fi; \
+    done; \
+    echo /opt/Polyphase )
+
+override POLYPHASE_PATH := $(patsubst %/,%,$(POLYPHASE_PATH))
+
+ifeq ($(wildcard $(POLYPHASE_PATH)/Engine/Source/Engine/Engine.h),)
+$(error POLYPHASE_PATH='$(POLYPHASE_PATH)' does not contain Engine/Source/Engine/Engine.h. \
+  Pass POLYPHASE_PATH=/path/to/polyphase-engine on the make command line. \
+  Inside WSL, Windows-side paths look like /mnt/<drive>/path/to/engine.)
+endif
+
+ADDON_PS2_RUNTIME = $(PROJECT_ROOT)/Packages/com.polyphase.build.target.ps2/Runtime/PS2
+
+# ---- Engine-target addon injection -----------------------------------------
+# Editor writes $(PROJECT_ROOT)/Generated/AddonInject.mk before invoking
+# GetCompileCommand. Defines ADDON_SOURCES / ADDON_DEFINES / ADDON_INCDIR /
+# ADDON_LIBDIR / ADDON_LIBS / ADDON_CPPFILES_EXTRA. `-include` is non-fatal.
+-include $(PROJECT_ROOT)/Generated/AddonInject.mk
+
+# ---- PS2DEV / PS2SDK resolution --------------------------------------------
+# Sentinel file: $(PS2DEV)/ps2sdk/samples/Makefile.eeglobal_cpp.
+#
+# Resolution order:
+#   1. PS2DEV set on the make command line (`make ... PS2DEV=...`).
+#   2. PS2DEV exported in the environment.
+#   3. Auto-detect at common install locations.
+ifeq ($(strip $(PS2DEV)),)
+PS2DEV_CANDIDATES := /usr/local/ps2dev /opt/ps2dev $(HOME)/ps2dev /mnt/c/ps2dev /mnt/d/ps2dev
+PS2DEV := $(firstword $(foreach d,$(PS2DEV_CANDIDATES),$(if $(wildcard $(d)/ps2sdk/samples/Makefile.eeglobal_cpp),$(d))))
+ifeq ($(strip $(PS2DEV)),)
+PS2DEV := /usr/local/ps2dev
+endif
+endif
+
+PS2SDK ?= $(PS2DEV)/ps2sdk
+
+# Export PATH so recursive ee-gcc / ee-ld / ee-ar invocations find the
+# toolchain even when the parent shell didn't set it. The native Windows
+# bundle prepends $(PS2DEV)/bin for host utilities (make, mkisofs, etc).
+export PATH := $(PS2DEV)/bin:$(PS2DEV)/ee/bin:$(PS2SDK)/bin:$(PATH)
+
+ifeq ($(wildcard $(PS2SDK)/samples/Makefile.eeglobal_cpp),)
+$(error PS2SDK not found at '$(PS2SDK)/samples/Makefile.eeglobal_cpp'. \
+  Install ps2dev: https://github.com/ps2dev/ps2dev/releases — Windows users \
+  download ps2dev-windows-latest.tar.gz, POSIX users use the one-line installer. \
+  Or set PS2DEV=/path/to/your/install when invoking make.)
+endif
+
+# ---- Source discovery -------------------------------------------------------
+# PS2SDK's Makefile.eeglobal_cpp does NOT auto-wildcard SOURCES — we enumerate
+# CPPFILES/CFILES explicitly below via $(foreach) on the SOURCES list.
+SOURCES = \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Assets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Animation \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/3D \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/Widgets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Domains \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/UI \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline/Tracks \
+    $(POLYPHASE_PATH)/Engine/Source/Plugins \
+    $(POLYPHASE_PATH)/Engine/Source/System \
+    $(POLYPHASE_PATH)/Engine/Source/Graphics \
+    $(POLYPHASE_PATH)/Engine/Source/Input \
+    $(POLYPHASE_PATH)/Engine/Source/Audio \
+    $(POLYPHASE_PATH)/Engine/Source/Network \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http/Backends \
+    $(POLYPHASE_PATH)/Engine/Source/Serial/Stub \
+    $(POLYPHASE_PATH)/Engine/Source/LuaBindings \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/IrrXML \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/BroadphaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionDispatch \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionShapes \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/Gimpact \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/NarrowPhaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Character \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/ConstraintSolver \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Dynamics \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Featherstone \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/MLCPSolvers \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Vehicle \
+    $(POLYPHASE_PATH)/External/Bullet/LinearMath \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Source \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
+    $(ADDON_PS2_RUNTIME) \
+    $(ADDON_PS2_RUNTIME)/Graphics_PS2GS \
+    $(PROJECT_ROOT)/Source \
+    $(ADDON_SOURCES)
+
+# ---- Include path -----------------------------------------------------------
+# PS2SDK's Makefile.eeglobal_cpp consumes EE_INCS (with -I prefix per item)
+# rather than PSP's bare INCDIR list. We build EE_INCS via addprefix.
+INC_DIRS = \
+    $(PROJECT_ROOT)/Generated \
+    $(ADDON_PS2_RUNTIME) \
+    $(ADDON_PS2_RUNTIME)/Graphics_PS2GS \
+    $(POLYPHASE_PATH)/Engine/Source \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/External \
+    $(POLYPHASE_PATH)/External/Bullet \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/glm \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/Assimp/contrib/rapidjson \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Include \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Include \
+    $(POLYPHASE_PATH)/Engine/External/PolyVox/include \
+    $(PS2SDK)/ports/include \
+    $(PS2DEV)/gsKit/include \
+    $(ADDON_INCDIR)
+
+EE_INCS = $(addprefix -I,$(INC_DIRS))
+
+# ---- Object list ------------------------------------------------------------
+# Flat-basename .o placed in CWD; VPATH tells make where to find each source.
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+
+# Embedded scripts only — NEVER include EmbeddedAssets.cpp (PS2 main RAM is
+# 32 MB, the same budget as PSP). Asset bytes load from disc / mc0:/ at
+# runtime via AssetManager::Discover.
+ifneq ($(wildcard $(PROJECT_ROOT)/Generated/EmbeddedScripts.cpp),)
+CPPFILES += EmbeddedScripts.cpp
+endif
+
+# Engine-target addon registrar (AddonPlugins.cpp etc.) contributed by
+# AddonInject.mk.
+CPPFILES += $(ADDON_CPPFILES_EXTRA)
+
+VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
+EE_OBJS := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
+
+# ---- Flags ------------------------------------------------------------------
+# Variant 2 platform-extension flag plus PS2-native macros. Makefile.eeglobal_cpp
+# will prepend -D_EE -G0 -O2 etc. — do NOT add -G0 ourselves; overriding breaks
+# the small-data area which PS2 link relies on.
+DEFINES = \
+    -DPOLYPHASE_PLATFORM_ADDON=1 \
+    -DPLATFORM_PS2=1 \
+    -DAPI_PS2GS=1 \
+    -DEDITOR=0 \
+    -DLUA_ENABLED=1 \
+    -DGLM_FORCE_RADIANS \
+    -DGLM_FORCE_UNRESTRICTED_GENTYPE \
+    -DLOGGING_ENABLED=1 \
+    $(addprefix -D,$(ADDON_DEFINES))
+
+# Why GLM_UNRESTRICTED_GENTYPE: PS2's R5900 EE FPU is not IEC559-conformant
+# (no NaN, no denormals — Sony optimised for game speed over IEEE 754
+# correctness). std::numeric_limits<float>::is_iec559 is therefore `false`
+# on PS2, and GLM's clamp/round/etc. static_assert that input types are
+# `is_iec559 || is_integer`, which rejects PS2 float. The escape hatch
+# GLM_UNRESTRICTED_GENTYPE adds a third branch (`|| true`) to the assert
+# so PS2 float passes — at the cost of nominal type-safety on those funcs.
+# Same workaround used by every PS2 homebrew that includes GLM.
+
+EE_CFLAGS   = -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES)
+EE_CXXFLAGS = $(EE_CFLAGS) -fno-exceptions -fno-rtti -std=gnu++17
+EE_ASFLAGS  = $(EE_CFLAGS)
+
+# ---- Libraries --------------------------------------------------------------
+# gsKit + dmaKit live in $(PS2SDK)/ports/lib. Standard EE libs (-lkernel, -lc)
+# are in $(PS2SDK)/ee/lib. Order is strict left-to-right ld resolution:
+# gsKit_toolkit → gsKit → dmaKit → patches → debug → m → c → kernel.
+#
+# Phase 0-2 doesn't need libpad / libmc / audsrv — those arrive with the
+# respective subsystem implementations in Phase 3+.
+#
+# fileXio is kept now for future filesystem extension; engine builds without
+# touching it in Phase 0-2.
+EE_LIBDIR = -L$(PS2SDK)/ports/lib -L$(PS2SDK)/ee/lib -L$(PS2DEV)/gsKit/lib $(addprefix -L,$(ADDON_LIBDIR))
+# --allow-multiple-definition: video addon's StbImageJpeg.cpp also defines
+# STB_IMAGE_IMPLEMENTATION, colliding with engine's stb_implementation.cpp.
+# Same workaround PSP uses for newlib/pspkernel strtol collisions.
+EE_LDFLAGS = $(EE_LIBDIR) -Wl,--allow-multiple-definition
+EE_LIBS = \
+    -lgskit_toolkit -lgskit -ldmakit \
+    -lfileXio -lpatches -ldebug \
+    -lm -lc -lkernel -latomic \
+    $(addprefix -l,$(ADDON_LIBS))
+# -latomic: engine's std::atomic<uint64_t>/atomic<bool> calls need libatomic
+# for sub-word RMW intrinsics (__atomic_fetch_add_4, __atomic_exchange_1) that
+# the EE GCC backend doesn't lower to native MIPS atomic instructions.
+# Library filenames are all-lowercase under $(PS2DEV)/gsKit/lib/ (libgskit.a,
+# libdmakit.a) despite docs and headers using mixed-case GSGLOBAL/GSKIT_*.
+
+# ---- Master rules + binary --------------------------------------------------
+EE_BIN = $(TARGET).elf
+
+# Default target MUST be declared before including Makefile.eeglobal_cpp.
+# The include defines a rule for $(EE_BIN) at line 75 — and GNU make picks
+# the FIRST target encountered in the file as default. Without declaring
+# `all: stage` here, the default becomes $(EE_BIN), which builds the ELF
+# in Intermediate/PS2/ but never copies it to Build/PS2/.
+.DEFAULT_GOAL := all
+all: stage
+
+# Makefile.pref defines the toolchain variables (EE_CC, EE_CXX, EE_LD, EE_AR,
+# EE_TOOL_PREFIX = mips64r5900el-ps2-elf-, etc.) — without it, EE_CXX is
+# empty and the compile recipe expands as `-D_EE -G0 ... -c file.cpp -o file.o`,
+# which the shell parses with the leading `-` stripped, ending up as
+# `D_EE: command not found` (error 127). Sample Makefiles always include
+# Makefile.pref BEFORE Makefile.eeglobal[_cpp]; we do the same.
+include $(PS2SDK)/samples/Makefile.pref
+include $(PS2SDK)/samples/Makefile.eeglobal_cpp
+
+# ---- Stage final ELF for the addon's GetCompiledBinaryPath ------------------
+# Master include builds $(EE_BIN) in $(CURDIR); we copy it to
+# $(PROJECT_ROOT)/Build/PS2/ so the rest of the build-target pipeline finds it.
+stage: $(EE_BIN)
+	@mkdir -p $(PROJECT_ROOT)/Build/PS2
+	@cp $(EE_BIN) $(PROJECT_ROOT)/Build/PS2/$(TARGET).elf
+	@echo "Staged $(PROJECT_ROOT)/Build/PS2/$(TARGET).elf"
+
+cleanstage:
+	@rm -rf $(PROJECT_ROOT)/Build/PS2

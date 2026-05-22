@@ -1,0 +1,22 @@
+{
+    "name": "com.polyphase.build.target.ps2",
+    "author": "Justin Jaro",
+    "description": "Adds a 'Sony PS2 (PS2SDK + gsKit)' build target to the Polyphase editor. Compiles via PS2SDK (mips64r5900el-ps2-elf-gcc), produces a bare ELF and optionally an mkisofs .iso for PCSX2 / FreeMcBoot. On Windows ps2dev ships a native build (https://github.com/ps2dev/ps2dev/releases); on Linux/macOS the toolchain runs natively against $PS2DEV. WSL routing is available as an opt-in fallback via the Target Options panel.",
+    "version": "1.0.0",
+    "native": {
+        "target": "editor",
+        "sourceDir": "Source",
+        "binaryName": "com.polyphase.build.target.ps2",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 4,
+        "resolveMode": "source",
+        "buildTargets": [
+            {
+                "id": "homebrew.ps2",
+                "displayName": "Sony PS2 (PS2SDK + gsKit)",
+                "category": "Retro Consoles"
+            }
+        ],
+        "binaries": []
+    }
+}
