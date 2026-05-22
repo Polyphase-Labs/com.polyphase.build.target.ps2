@@ -39,6 +39,7 @@
 #include "Engine/Nodes/3D/Skybox3D.h"
 #include "Engine/Nodes/3D/SkeletalMesh3d.h"
 #include "Engine/Nodes/3D/InstancedMesh3d.h"
+#include "Engine/Nodes/3D/Particle3d.h"
 #include "Engine/Nodes/3D/DirectionalLight3d.h"
 #include "Engine/Nodes/Widgets/Quad.h"
 #include "Engine/Nodes/Widgets/Text.h"
@@ -155,7 +156,7 @@ namespace
         // That manifested as initial-boot flashing + ghost trails on
         // animated meshes + strobing of unlit prims against the static
         // grid background.
-        const u64 kClearColor = GS_SETREG_RGBAQ(0x20, 0x20, 0x40, 0x80, 0);
+        const u64 kClearColor = GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0);
         for (int i = 0; i < 2; ++i)
         {
             gsKit_clear(sGsGlobal, kClearColor);
@@ -189,11 +190,12 @@ void GFX_BeginFrame()
 {
     if (sGsGlobal == nullptr) return;
 
-    // Dark blue clear. Alpha 0x80 = full-opacity src under the active
-    // (Cs-Cd)*As+Cd blend equation, so the clear actually wipes the
-    // previous frame. Alpha 0x00 would make the clear a no-op (output =
-    // dst) and you'd see ghost-trails from animated objects.
-    gsKit_clear(sGsGlobal, GS_SETREG_RGBAQ(0x20, 0x20, 0x40, 0x80, 0));
+    // Black clear. Scenes without a Skybox3D expect a black background;
+    // scenes with one will overdraw this anyway, so black is the safe
+    // default. Alpha 0x80 = full-opacity src so the clear actually wipes
+    // the previous frame (alpha 0x00 would no-op under the active
+    // (Cs-Cd)*As+Cd blend, causing ghost trails).
+    gsKit_clear(sGsGlobal, GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0));
 }
 
 void GFX_EndFrame()
@@ -1047,10 +1049,182 @@ void GFX_UpdateTileMap2DResource(TileMap2D* /*tm*/, const std::vector<VertexColo
 void GFX_DrawTileMap2D(TileMap2D* /*tm*/) {}
 
 // ----- Particles ----------------------------------------------------------
-void GFX_CreateParticleCompResource(Particle3D* /*p*/) {}
-void GFX_DestroyParticleCompResource(Particle3D* /*p*/) {}
-void GFX_UpdateParticleCompVertexBuffer(Particle3D* /*p*/, const std::vector<VertexParticle>& /*vertices*/) {}
-void GFX_DrawParticleComp(Particle3D* /*p*/) {}
+// =========================================================================
+// Particles — Phase 3
+// =========================================================================
+// Pattern matches PSP (memory: project_psp_particles).
+//
+// Engine CPU-simulates particles each frame (Particle3D's tick). When it's
+// done, it hands us a flat std::vector<VertexParticle> via
+// GFX_UpdateParticleCompVertexBuffer — 4 verts per particle, billboard
+// corners pre-oriented to face the camera. We repack 4→6 verts (two
+// triangles per quad, indices 0-1-2 / 2-1-3) into a per-comp buffer.
+//
+// Per-vertex: position (vec3 world or local), UV (vec2), color (u32 RGBA8).
+// No normal — particles are unlit. Per-vertex color encodes both tint and
+// fade-out alpha (engine sets alpha from the particle's age curve).
+//
+// useLocalSpace: when true, vertex positions are in the comp's LOCAL frame
+// and we apply comp->GetTransform() as the model matrix; when false, they
+// already live in world space and we use identity.
+
+namespace
+{
+    std::unordered_map<Particle3D*, std::vector<VertexParticle>> sParticleVerts;
+}
+
+void GFX_CreateParticleCompResource(Particle3D* p)
+{
+    if (p == nullptr) return;
+    sParticleVerts[p];  // ensure slot exists; buffer fills lazily on first update
+}
+
+void GFX_DestroyParticleCompResource(Particle3D* p)
+{
+    if (p == nullptr) return;
+    sParticleVerts.erase(p);
+}
+
+void GFX_UpdateParticleCompVertexBuffer(Particle3D* p, const std::vector<VertexParticle>& vertices)
+{
+    if (p == nullptr) return;
+    const uint32_t numInputVerts = (uint32_t)vertices.size();
+    const uint32_t numParticles  = numInputVerts / 4;
+    if (numParticles == 0)
+    {
+        sParticleVerts[p].clear();
+        return;
+    }
+
+    // Expand 4 quad-corners → 6 triangle-list verts per particle. Winding
+    // 0-1-2 / 2-1-3 matches PSP/GameCube convention (triangle 1 = top-left
+    // half, triangle 2 = bottom-right half).
+    std::vector<VertexParticle>& out = sParticleVerts[p];
+    out.resize(numParticles * 6);
+    for (uint32_t i = 0; i < numParticles; ++i)
+    {
+        const VertexParticle* q = vertices.data() + i * 4;
+        VertexParticle*       d = out.data()      + i * 6;
+        d[0] = q[0]; d[1] = q[1]; d[2] = q[2];
+        d[3] = q[2]; d[4] = q[1]; d[5] = q[3];
+    }
+}
+
+void GFX_DrawParticleComp(Particle3D* p)
+{
+    if (sGsGlobal == nullptr || p == nullptr) return;
+    if (p->GetNumParticles() == 0) return;
+
+    auto it = sParticleVerts.find(p);
+    if (it == sParticleVerts.end() || it->second.empty()) return;
+    const std::vector<VertexParticle>& verts = it->second;
+
+    World* world = GetWorld(0);
+    if (world == nullptr) return;
+    Camera3D* camera = world->GetActiveCamera();
+    if (camera == nullptr) return;
+
+    // World-space when useLocalSpace=false (engine has already baked
+    // emitter transform into vertex positions); local space when true (we
+    // apply the comp's transform here).
+    const glm::mat4 model = p->GetUseLocalSpace() ? p->GetTransform()
+                                                  : glm::mat4(1.0f);
+    const glm::mat4 mvp   = camera->GetViewProjectionMatrix() * model;
+
+    // Texture: from comp's material (or default). Particles modulate
+    // texture by per-vertex color (which carries the age-fade alpha).
+    Material* matBase = p->GetMaterial();
+    MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+    Ps2TextureData* texSlot = nullptr;
+    if (mat != nullptr && mat->GetTexture(0) != nullptr)
+    {
+        auto texIt = sTextures.find(mat->GetTexture(0));
+        if (texIt != sTextures.end()) texSlot = &texIt->second;
+    }
+
+    // Particles want alpha blending ON — the engine encodes age-fade into
+    // each vertex's alpha channel, and overlapping particles should
+    // alpha-composite. Restore on entry, the 3D-mesh draw path below
+    // disables it for solid meshes.
+    sGsGlobal->PrimAlphaEnable = GS_SETTING_ON;
+
+    if (texSlot != nullptr)
+    {
+        gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
+        gsKit_set_clamp(sGsGlobal, texSlot->mClampMode);
+    }
+    const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
+    const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
+
+    const uint32_t numTris = (uint32_t)verts.size() / 3;
+    for (uint32_t t = 0; t < numTris; ++t)
+    {
+        const VertexParticle& v0 = verts[t * 3 + 0];
+        const VertexParticle& v1 = verts[t * 3 + 1];
+        const VertexParticle& v2 = verts[t * 3 + 2];
+
+        const glm::vec4 p0 = mvp * glm::vec4(v0.mPosition, 1.0f);
+        const glm::vec4 p1 = mvp * glm::vec4(v1.mPosition, 1.0f);
+        const glm::vec4 p2 = mvp * glm::vec4(v2.mPosition, 1.0f);
+        if (p0.w <= 0.0f || p1.w <= 0.0f || p2.w <= 0.0f) continue;
+
+        const float invW0 = 1.0f / p0.w, invW1 = 1.0f / p1.w, invW2 = 1.0f / p2.w;
+        const float nx0 = p0.x * invW0, ny0 = p0.y * invW0, nz0 = p0.z * invW0;
+        const float nx1 = p1.x * invW1, ny1 = p1.y * invW1, nz1 = p1.z * invW1;
+        const float nx2 = p2.x * invW2, ny2 = p2.y * invW2, nz2 = p2.z * invW2;
+
+        const float x0 = (nx0 * 0.5f + 0.5f) * kViewportW;
+        const float y0 = (1.0f - (ny0 * 0.5f + 0.5f)) * kViewportH;
+        const float x1 = (nx1 * 0.5f + 0.5f) * kViewportW;
+        const float y1 = (1.0f - (ny1 * 0.5f + 0.5f)) * kViewportH;
+        const float x2 = (nx2 * 0.5f + 0.5f) * kViewportW;
+        const float y2 = (1.0f - (ny2 * 0.5f + 0.5f)) * kViewportH;
+
+        // No backface cull for particles — quads are always camera-facing
+        // billboards, and the engine emits them with consistent winding.
+
+        const int iz0 = (int)((1.0f - nz0) * 16383.5f);
+        const int iz1 = (int)((1.0f - nz1) * 16383.5f);
+        const int iz2 = (int)((1.0f - nz2) * 16383.5f);
+
+        // Per-vertex packed RGBA → gsKit RGBAQ. Engine RGBA8 is (r at lsb).
+        // No widget-tint multiply for particles; the engine already baked
+        // age fade into the alpha channel.
+        auto pack = [](uint32_t c) -> u64 {
+            const u32 r = ((c >>  0) & 0xFFu);
+            const u32 g = ((c >>  8) & 0xFFu);
+            const u32 b = ((c >> 16) & 0xFFu);
+            const u32 a = ((c >> 24) & 0xFFu);
+            // Send engine RGB at FULL 0-255 range, not halved. gsKit's
+            // modulate reference is 0x80, so engine_color=0xFF → modulate
+            // factor = 255/128 ≈ 2.0 which saturates back to 1.0 — i.e.,
+            // a full-bright engine color produces texel*1.0 = unaltered
+            // texture. Halving (>> 1) was making 0xFF into 0x7F (mod 0.99x)
+            // and 0x80 into 0x40 (mod 0.5x), darkening every particle by
+            // ~half. Alpha stays full range so the engine's per-particle
+            // age-fade controls the blend.
+            return GS_SETREG_RGBAQ(r, g, b, a, 0);
+        };
+        const u64 c0 = pack(v0.mColor);
+        const u64 c1 = pack(v1.mColor);
+        const u64 c2 = pack(v2.mColor);
+
+        if (texSlot != nullptr)
+        {
+            gsKit_prim_triangle_goraud_texture_3d(sGsGlobal, &texSlot->mGsTex,
+                x0, y0, iz0, v0.mTexcoord.x * texW, v0.mTexcoord.y * texH,
+                x1, y1, iz1, v1.mTexcoord.x * texW, v1.mTexcoord.y * texH,
+                x2, y2, iz2, v2.mTexcoord.x * texW, v2.mTexcoord.y * texH,
+                c0, c1, c2);
+        }
+        else
+        {
+            const int izAvg = (iz0 + iz1 + iz2) / 3;
+            gsKit_prim_triangle_gouraud(sGsGlobal,
+                x0, y0, x1, y1, x2, y2, izAvg, c0, c1, c2);
+        }
+    }
+}
 
 // ----- UI: Quad / QuadBorder / Text / Poly -------------------------------
 // =========================================================================
