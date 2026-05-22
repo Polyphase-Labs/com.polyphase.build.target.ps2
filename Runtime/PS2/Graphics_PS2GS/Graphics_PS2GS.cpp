@@ -650,13 +650,23 @@ namespace
         const u32 r = (u32)(col.r * 0x80);
         const u32 g = (u32)(col.g * 0x80);
         const u32 b = (u32)(col.b * 0x80);
-        return GS_SETREG_RGBAQ(r, g, b, 0x80, 0);
+        // Alpha 0xFF (overbright) instead of 0x80 (identity). The GS blend
+        // equation `(Cs-Cd)*As+Cd` interprets source alpha via /128, so
+        // 0xFF → As=255/128≈2.0 saturated to 1.0 → guaranteed opaque
+        // output. With 0x80 modulation, a texel with alpha < 255 (mipmap
+        // artifact, PNG decoder quirk, padding band edge) produced partial
+        // blend with the framebuffer — that's what generated the
+        // cube's "lighting flicker" symptom (darker with sky behind,
+        // half-bright with clear color behind). Forcing alpha overbright
+        // makes 3D mesh draws blend-immune regardless of texel alpha.
+        return GS_SETREG_RGBAQ(r, g, b, 0xFF, 0);
     }
 
-    // gsKit's identity-modulation color: texel * 1.0, alpha pass-through.
+    // Same alpha-overbright trick — opaque pass-through for unlit 3D
+    // meshes (skybox, debug grids).
     inline u64 UnlitModulationColor()
     {
-        return GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0);
+        return GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0xFF, 0);
     }
 
     // Look up the material's shading model. Unlit → no Lambert in
@@ -668,31 +678,7 @@ namespace
         if (comp == nullptr) return false;
         Material* matBase = comp->GetMaterial();
         MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
-        const bool result = (mat != nullptr) && (mat->GetShadingModel() == ShadingModel::Unlit);
-
-        // Diagnostic: log every time a comp's unlit verdict changes. If the
-        // animated cube's lighting "blinks on and off" then this flag is
-        // toggling, and the log line will show what GetMaterial / AsLite /
-        // ShadingModel returned on the bad frame.
-        static std::unordered_map<StaticMesh3D*, bool> sPrevUnlit;
-        static std::unordered_map<StaticMesh3D*, int>  sLogCount;
-        auto it = sPrevUnlit.find(comp);
-        const bool firstSeen = (it == sPrevUnlit.end());
-        const bool changed   = !firstSeen && (it->second != result);
-        if ((firstSeen || changed) && sLogCount[comp] < 20)
-        {
-            LogDebug("[PS2-LIT] comp=%p name='%s' unlit=%d  matBase=%p lite=%p shading=%d  reason=%s",
-                     (void*)comp,
-                     comp->GetName().c_str(),
-                     (int)result,
-                     (void*)matBase, (void*)mat,
-                     mat ? (int)mat->GetShadingModel() : -1,
-                     firstSeen ? "first-seen" : "CHANGED");
-            sLogCount[comp]++;
-        }
-        sPrevUnlit[comp] = result;
-
-        return result;
+        return (mat != nullptr) && (mat->GetShadingModel() == ShadingModel::Unlit);
     }
     bool IsCompUnlit(SkeletalMesh3D* comp)
     {
@@ -727,6 +713,19 @@ namespace
                         bool invertCull)
     {
         if (sGsGlobal == nullptr || verts.empty() || indices.empty()) return;
+
+        // 3D meshes always render opaque — disable PRIM's ABE bit for the
+        // duration of this draw. gsKit reads gsGlobal->PrimAlphaEnable when
+        // emitting the PRIM register for each prim call, so toggling here
+        // sets every subsequent prim to ABE=0. The cube's intermittent
+        // "lighting flicker" symptom (darker with sky, half-bright without)
+        // was the cube alpha-blending with the framebuffer on some frames
+        // even though my computed RGBA was provably stable — the GS was
+        // re-blending the modulated output with dst in some way our
+        // stable-input math couldn't influence. Skipping blend at the PRIM
+        // level eliminates that variable entirely. UI draws re-enable
+        // PrimAlphaEnable below for the font glyph mask blend they need.
+        sGsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
 
         // Bind texture once for the whole mesh, and apply its wrap mode
         // (engine Texture::GetWrapMode → gsKit GS_CMODE_*). gsKit's clamp
@@ -781,8 +780,24 @@ namespace
             // meshes have inverted normals (camera is INSIDE the mesh), so
             // the visible faces have flipped winding — invert the cull
             // condition to render the inward-facing side.
+            //
+            // EPSILON DEAD-BAND: triangles whose signed area is right
+            // around 0 are edge-on to the camera. PS2's non-IEC559 FPU has
+            // limited precision, so on an animated mesh the sign of the
+            // computed area can flip frame-to-frame across the 0 boundary,
+            // toggling triangles between drawn and culled. That manifests
+            // as lighting "blinking on and off" because cube faces
+            // momentarily disappear when they're edge-on. Cull anything
+            // within ±0.5 px² of zero; visually those triangles cover less
+            // than a pixel anyway.
             const float signedArea = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-            if (invertCull ? (signedArea <= 0.0f) : (signedArea >= 0.0f)) continue;
+            constexpr float kCullEpsilon = 0.5f;
+            if (invertCull
+                ? (signedArea <=  kCullEpsilon)
+                : (signedArea >= -kCullEpsilon))
+            {
+                continue;
+            }
 
             const int iz0 = (int)((1.0f - nz0) * 16383.5f);
             const int iz1 = (int)((1.0f - nz1) * 16383.5f);
@@ -862,32 +877,6 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     PointLightish light = GatherMainLight(world);
     const bool isSkybox  = comp->As<Skybox3D>() != nullptr;
     const bool wantUnlit = IsCompUnlit(comp) || isSkybox;  // sky = no lighting
-
-    // Diagnostic for the animated-cube lighting flicker. Logs every ~60
-    // frames per comp + on every transition (no light found, NaN model,
-    // skybox flag change). Cap each comp to 30 lines to keep log readable.
-    {
-        static std::unordered_map<StaticMesh3D*, int>  sFrameTick;
-        static std::unordered_map<StaticMesh3D*, int>  sLines;
-        static std::unordered_map<StaticMesh3D*, bool> sPrevLight;
-        const bool lightChanged = sPrevLight.count(comp) > 0 && sPrevLight[comp] != light.mFound;
-        const bool modelBad     = !(model[0][0] == model[0][0]);
-        const int ticks = ++sFrameTick[comp];
-        if ((ticks % 60 == 1 || lightChanged || modelBad) && sLines[comp] < 30)
-        {
-            LogDebug("[PS2-LIT] %s f=%d unlit=%d sky=%d  light_found=%d ldir=(%.2f,%.2f,%.2f) lcol=(%.2f,%.2f,%.2f)  m00=%.3f m11=%.3f m22=%.3f%s%s",
-                     comp->GetName().c_str(), ticks,
-                     (int)wantUnlit, (int)isSkybox,
-                     (int)light.mFound,
-                     light.mDir.x, light.mDir.y, light.mDir.z,
-                     light.mColor.r, light.mColor.g, light.mColor.b,
-                     model[0][0], model[1][1], model[2][2],
-                     lightChanged ? "  LIGHT-CHG" : "",
-                     modelBad ? "  MODEL-NAN" : "");
-            sLines[comp]++;
-        }
-        sPrevLight[comp] = light.mFound;
-    }
 
     DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light, wantUnlit, isSkybox);
 }
@@ -1113,6 +1102,12 @@ namespace
         }
         const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
         const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
+
+        // UI needs alpha blend ON — font glyph masks rely on the
+        // src*As+dst*(1-As) equation to render only the glyph shape. 3D
+        // mesh draws disable it (above in DrawTrisHelper) for opacity
+        // stability; we re-arm it here.
+        sGsGlobal->PrimAlphaEnable = GS_SETTING_ON;
 
         const uint32_t numTris = numVerts / 3;
         for (uint32_t t = 0; t < numTris; ++t)
