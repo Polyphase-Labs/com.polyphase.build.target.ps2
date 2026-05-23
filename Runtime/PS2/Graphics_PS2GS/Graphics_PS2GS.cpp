@@ -1098,74 +1098,11 @@ void GFX_DrawTextMeshComp(TextMesh3D* c)
 }
 
 // ----- Voxel / Terrain / TileMap -----------------------------------------
-// ----- Voxel3D / Terrain3D ------------------------------------------------
-// Same shape as TileMap2D: engine cooks (VertexColor, IndexType) per comp,
-// we MVP-transform and draw via the shared helper.
-
-void GFX_CreateVoxel3DResource(Voxel3D* v)
-{
-    if (v == nullptr) return;
-    sVoxels[v];
-}
-void GFX_DestroyVoxel3DResource(Voxel3D* v)
-{
-    if (v == nullptr) return;
-    sVoxels.erase(v);
-}
-void GFX_UpdateVoxel3DResource(Voxel3D* v,
-                                const std::vector<VertexColor>& vertices,
-                                const std::vector<IndexType>&   indices)
-{
-    if (v == nullptr) return;
-    auto& d = sVoxels[v];
-    d.mVerts   = vertices;
-    d.mIndices = indices;
-}
-void GFX_DrawVoxel3D(Voxel3D* v)
-{
-    if (v == nullptr) return;
-    auto it = sVoxels.find(v);
-    if (it == sVoxels.end()) return;
-    DrawVertexColorMesh(it->second, v->GetRenderTransform(),
-                        GetVcMeshTexture(v));
-}
-
-void GFX_CreateTerrain3DResource(Terrain3D* t)
-{
-    if (t == nullptr) return;
-    sTerrains[t];
-}
-void GFX_DestroyTerrain3DResource(Terrain3D* t)
-{
-    if (t == nullptr) return;
-    sTerrains.erase(t);
-}
-void GFX_UpdateTerrain3DResource(Terrain3D* t,
-                                  const std::vector<VertexColor>& vertices,
-                                  const std::vector<IndexType>&   indices)
-{
-    if (t == nullptr) return;
-    auto& d = sTerrains[t];
-    d.mVerts   = vertices;
-    d.mIndices = indices;
-}
-void GFX_DrawTerrain3D(Terrain3D* t)
-{
-    if (t == nullptr) return;
-    auto it = sTerrains.find(t);
-    if (it == sTerrains.end()) return;
-    DrawVertexColorMesh(it->second, t->GetRenderTransform(),
-                        GetVcMeshTexture(t));
-}
-
-// =========================================================================
-// TileMap2D — Phase 3
-// =========================================================================
-// Engine CPU-builds a triangle mesh from the tilemap's tile grid + tileset
-// atlas each time the tilemap changes, then hands us VertexColor + indices.
-// We stash per-comp and draw with the same MVP transform path as static
-// meshes — unlit (tilemaps are typically self-illuminated 2D art), no
-// backface cull (tiles can be viewed from either side at any angle).
+// ----- Voxel3D / Terrain3D / TileMap2D ------------------------------------
+// Same shape: engine cooks (VertexColor, IndexType) per comp, we MVP-
+// transform and draw via the shared helper. Maps + helpers defined first so
+// the per-comp GFX_* functions below (and the TileMap2D block further down)
+// can reference them.
 
 namespace
 {
@@ -1271,6 +1208,73 @@ namespace
         return (it != sTextures.end()) ? &it->second : nullptr;
     }
 }
+
+void GFX_CreateVoxel3DResource(Voxel3D* v)
+{
+    if (v == nullptr) return;
+    sVoxels[v];
+}
+void GFX_DestroyVoxel3DResource(Voxel3D* v)
+{
+    if (v == nullptr) return;
+    sVoxels.erase(v);
+}
+void GFX_UpdateVoxel3DResource(Voxel3D* v,
+                                const std::vector<VertexColor>& vertices,
+                                const std::vector<IndexType>&   indices)
+{
+    if (v == nullptr) return;
+    auto& d = sVoxels[v];
+    d.mVerts   = vertices;
+    d.mIndices = indices;
+}
+void GFX_DrawVoxel3D(Voxel3D* v)
+{
+    if (v == nullptr) return;
+    auto it = sVoxels.find(v);
+    if (it == sVoxels.end()) return;
+    DrawVertexColorMesh(it->second, v->GetRenderTransform(),
+                        GetVcMeshTexture(v));
+}
+
+void GFX_CreateTerrain3DResource(Terrain3D* t)
+{
+    if (t == nullptr) return;
+    sTerrains[t];
+}
+void GFX_DestroyTerrain3DResource(Terrain3D* t)
+{
+    if (t == nullptr) return;
+    sTerrains.erase(t);
+}
+void GFX_UpdateTerrain3DResource(Terrain3D* t,
+                                  const std::vector<VertexColor>& vertices,
+                                  const std::vector<IndexType>&   indices)
+{
+    if (t == nullptr) return;
+    auto& d = sTerrains[t];
+    d.mVerts   = vertices;
+    d.mIndices = indices;
+}
+void GFX_DrawTerrain3D(Terrain3D* t)
+{
+    if (t == nullptr) return;
+    auto it = sTerrains.find(t);
+    if (it == sTerrains.end()) return;
+    DrawVertexColorMesh(it->second, t->GetRenderTransform(),
+                        GetVcMeshTexture(t));
+}
+
+// =========================================================================
+// TileMap2D — Phase 3
+// =========================================================================
+// Engine CPU-builds a triangle mesh from the tilemap's tile grid + tileset
+// atlas each time the tilemap changes, then hands us VertexColor + indices.
+// We stash per-comp and draw with the same MVP transform path as static
+// meshes — unlit (tilemaps are typically self-illuminated 2D art), no
+// backface cull (tiles can be viewed from either side at any angle).
+// Storage + DrawVertexColorMesh + GetVcMeshTexture live in the namespace
+// block above Voxel3D so all three users (Voxel/Terrain/TileMap) see them.
 
 void GFX_CreateTileMap2DResource(TileMap2D* tm)
 {

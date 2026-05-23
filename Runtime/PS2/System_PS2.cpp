@@ -701,6 +701,58 @@ namespace
         strncpy((char*)out.del,  kIconIcnFileName, sizeof(out.del)  - 1);
     }
 
+    // ---- libmc async-then-sync wrappers ------------------------------------
+    // Every mc* function (except mcInit/mcGetInfo's blocking shape) is async;
+    // pair each with mcSync(0, &cmd, &result) and surface `result` as the
+    // call's logical return. Declared here (before the first user) so
+    // McWriteIconSysIfMissing / McEnsureSaveDir below can call them.
+    int McOpenSync(const std::string& path, int mode)
+    {
+        int cmd = 0, result = 0;
+        if (mcOpen(kMcPort, kMcSlot, path.c_str(), mode) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    int McReadSync(int fd, void* buf, int size)
+    {
+        int cmd = 0, result = 0;
+        if (mcRead(fd, buf, size) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    int McWriteSync(int fd, const void* buf, int size)
+    {
+        int cmd = 0, result = 0;
+        if (mcWrite(fd, buf, size) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    int McSeekSync(int fd, int offset, int whence)
+    {
+        int cmd = 0, result = 0;
+        if (mcSeek(fd, offset, whence) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    void McCloseSync(int fd)
+    {
+        int cmd = 0, result = 0;
+        mcClose(fd);
+        mcSync(0, &cmd, &result);
+    }
+
+    int McDeleteSync(const std::string& path)
+    {
+        int cmd = 0, result = 0;
+        if (mcDelete(kMcPort, kMcSlot, path.c_str()) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
     bool McWriteIconSysIfMissing()
     {
         // Probe first — don't re-write icon.sys on every save (wastes EE↔IOP
@@ -756,53 +808,6 @@ namespace
         // and displays it. Idempotent — only writes if icon.sys is missing.
         McWriteIconSysIfMissing();
         return true;
-    }
-
-    int McOpenSync(const std::string& path, int mode)
-    {
-        int cmd = 0, result = 0;
-        if (mcOpen(kMcPort, kMcSlot, path.c_str(), mode) < 0) return -1;
-        mcSync(0, &cmd, &result);
-        return result;
-    }
-
-    int McReadSync(int fd, void* buf, int size)
-    {
-        int cmd = 0, result = 0;
-        if (mcRead(fd, buf, size) < 0) return -1;
-        mcSync(0, &cmd, &result);
-        return result;
-    }
-
-    int McWriteSync(int fd, const void* buf, int size)
-    {
-        int cmd = 0, result = 0;
-        if (mcWrite(fd, buf, size) < 0) return -1;
-        mcSync(0, &cmd, &result);
-        return result;
-    }
-
-    int McSeekSync(int fd, int offset, int whence)
-    {
-        int cmd = 0, result = 0;
-        if (mcSeek(fd, offset, whence) < 0) return -1;
-        mcSync(0, &cmd, &result);
-        return result;
-    }
-
-    void McCloseSync(int fd)
-    {
-        int cmd = 0, result = 0;
-        mcClose(fd);
-        mcSync(0, &cmd, &result);
-    }
-
-    int McDeleteSync(const std::string& path)
-    {
-        int cmd = 0, result = 0;
-        if (mcDelete(kMcPort, kMcSlot, path.c_str()) < 0) return -1;
-        mcSync(0, &cmd, &result);
-        return result;
     }
 }
 

@@ -5,9 +5,9 @@
  * Architecture (mirrors Audio_PSP.cpp; memory: project_psp_audio_mixer):
  *   - Engine drives AUD_Play(voiceIndex, soundWave, ...) onto a voice table,
  *     parallel streams via AUD_OpenStream / AUD_SubmitStreamBuffer.
- *   - A mixer thread sleeps inside audsrv_play_audio. When the IOP-side
- *     audsrv consumes the buffer the call returns, the thread mixes voices +
- *     streams into a stereo S16LE block, and submits the next one.
+ *   - A mixer thread blocks inside audsrv_wait_audio(N) until the audsrv
+ *     ring on the IOP has N bytes of free space, then mixes voices + streams
+ *     into a stereo S16LE block and queues it with audsrv_play_audio.
  *   - Per-voice nearest-neighbour resampling via fractional cursor advanced
  *     by `rate = srcSampleRate * pitch / 44100` per output frame.
  *
@@ -21,9 +21,24 @@
  *   - sVoiceLock semaphore (initial=1, max=1) guards both sVoices and
  *     sStreams. Engine-side mutators take it briefly; mixer takes it for
  *     the duration of one buffer fill (~few hundred µs) and drops it before
- *     audsrv_play_audio (which blocks until the IOP has consumed a buffer).
+ *     audsrv_play_audio. The wait-for-ring-room is done by audsrv_wait_audio
+ *     BEFORE the mix, so the mixer holds no locks while blocked on the IOP.
  *   - SoundWave pointers in voices are weak refs — engine keeps the
  *     SoundWave alive via asset ref count.
+ *
+ * audsrv pacing — the bug that wasn't:
+ *   Earlier this file paced the mixer with usleep(20ms) after each
+ *   audsrv_play_audio call, on the (incorrect) assumption that
+ *   audsrv_play_audio blocks until the IOP drains the previous buffer
+ *   (cf. sceAudioOutputBlocking on PSP). The audsrv header is explicit
+ *   (audsrv.h:107-113): audsrv_play_audio "will not interrupt a playing
+ *   buffer, rather queue it up". It is non-blocking and returns the
+ *   number of bytes accepted. usleep-based pacing therefore drifted out
+ *   of step with the SPU2 ring on PCSX2 and real hardware alike — the
+ *   ring would drain during the sleep, SPU2 would finish its last block
+ *   (audsrv does not auto-restart SPU2 from drain), and audio went silent
+ *   after the first buffer. audsrv_wait_audio(N) is the genuine
+ *   ring-pressure primitive and is what every audsrv example uses.
  */
 
 #if defined(POLYPHASE_PLATFORM_ADDON)
@@ -256,25 +271,22 @@ namespace
 
     void MixerThread(void* /*arg*/)
     {
-        // 1024 frames @ 44100 Hz = 23.2 ms of audio per buffer. We sleep
-        // slightly SHORTER than that (20 ms) so the mixer stays a bit
-        // ahead of consumption — gives audsrv a small frame of headroom
-        // and avoids underrun-then-overrun oscillation. Symptom that
-        // diagnoses an over-fast mixer: audio plays once then loops the
-        // last buffer indefinitely (audsrv's ring drained, SPU2 repeats
-        // its last received block).
-        //
-        // usleep arg is microseconds. PS2SDK's newlib routes this through
-        // SetAlarm + SleepThread internally — no busy-wait, the EE is
-        // free to run other threads during the sleep.
-        constexpr useconds_t kMixerSleepUs = 20 * 1000;
+        // audsrv_wait_audio blocks until at least kBytesPerBuffer of free
+        // space exists in audsrv's IOP-side ring. That call is the pacing
+        // primitive — the EE thread parks here, the IOP keeps feeding SPU2,
+        // and we wake the moment there's room for the next buffer. We mix
+        // and submit AFTER the wait so the freshly-mixed buffer is as
+        // close as possible to the playhead (lower added latency).
         while (sMixerRun)
         {
+            audsrv_wait_audio(kBytesPerBuffer);
             MixOneBuffer();
             audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
-            usleep(kMixerSleepUs);
         }
+        // Drain with one silent buffer so SPU2 doesn't loop its last block
+        // audibly on shutdown.
         memset(sOutBuffer, 0, sizeof(sOutBuffer));
+        audsrv_wait_audio(kBytesPerBuffer);
         audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
         ExitThread();
     }
@@ -342,7 +354,12 @@ void AUD_Initialize()
     th.stack       = sMixerStack;
     th.stack_size  = sizeof(sMixerStack);
     th.gp_reg      = currentGp;
-    th.initial_priority = 0x40;
+    // EE thread priority: lower number = higher priority. Main thread runs
+    // at the default 0x40, so 0x30 puts the mixer a few levels above the
+    // game — keeps audio fed even when a heavy frame stalls the game thread.
+    // Safe because the mixer spends nearly all its time parked inside
+    // audsrv_wait_audio rather than burning CPU.
+    th.initial_priority = 0x30;
     th.attr        = 0;
     th.option      = 0;
     sMixerThread = CreateThread(&th);
@@ -368,10 +385,24 @@ void AUD_Shutdown()
     sMixerRun = false;
     if (sMixerThread >= 0)
     {
-        // Mixer will exit on its own after one more audsrv_play_audio
-        // blocking call returns. WaitSema-style wait isn't necessary —
-        // PS2 EE doesn't have sceKernelWaitThreadEnd; the thread frees
-        // its resources via ExitThread.
+        // PS2 EE has no WaitThread() — the canonical pattern is to poll
+        // ReferThreadStatus until the thread enters THS_DORMANT (i.e. ran
+        // its ExitThread). The mixer is blocked inside audsrv_wait_audio
+        // most of the time; we have to wait at least one buffer period
+        // (~23 ms) for it to wake, observe sMixerRun=false, submit the
+        // silent drain buffer, and exit. Cap the wait at ~250 ms so a
+        // wedged audsrv (e.g. IRX hung) can't deadlock shutdown.
+        ee_thread_status_t info;
+        const int kMaxPollMs = 250;
+        int waitedMs = 0;
+        while (waitedMs < kMaxPollMs
+               && ReferThreadStatus(sMixerThread, &info) >= 0
+               && info.status != THS_DORMANT)
+        {
+            usleep(5 * 1000);
+            waitedMs += 5;
+        }
+        DeleteThread(sMixerThread);
         sMixerThread = -1;
     }
 
@@ -608,6 +639,11 @@ int32_t AUD_SubmitStreamBuffer(uint32_t streamId, const uint8_t* data, uint32_t 
 uint64_t AUD_GetStreamPlayedSamples(uint32_t streamId)
 {
     if (streamId == 0 || streamId > kMaxStreams) return 0;
+    // Read without locking — readFrameAbs is a double (8 bytes); on the
+    // 32-bit-load R5900 EE the load isn't atomic, but A/V sync consumers
+    // tolerate a few-µs-stale value better than the contention this would
+    // add to the mixer's per-frame loop. If sync glitches surface here,
+    // switch to a 64-bit uint counter updated separately under the lock.
     const Ps2Stream& s = sStreams[streamId - 1];
     return s.inUse ? (uint64_t)s.readFrameAbs : 0;
 }
