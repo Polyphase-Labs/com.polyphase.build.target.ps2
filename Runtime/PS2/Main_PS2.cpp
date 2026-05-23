@@ -27,6 +27,7 @@
 #include <sbv_patches.h>
 #include <debug.h>           // init_scr / scr_printf — boot-phase tty
 #include <audsrv.h>          // EE-side stubs for the audsrv IOP module
+#include <libmc.h>           // EE-side stubs for mcman/mcserv — memory card
 #include <stdio.h>
 #include <string.h>
 
@@ -147,6 +148,15 @@ int main(int argc, char** argv)
     // then audsrv from our embedded buffer, then audsrv_init(). Any
     // failure → audio offline but engine continues silently.
     {
+        // Input prerequisites: SIO2MAN drives the controller/MC I/O ports,
+        // PADMAN is the EE-side pad RPC client. Both ROM-resident on every
+        // PS2 + PCSX2. Load BEFORE audsrv so libpad's padInit (called in
+        // Input_PS2::INP_Initialize) finds PADMAN already running.
+        const int sio2Ret = SifLoadModule("rom0:SIO2MAN", 0, nullptr);
+        if (sio2Ret < 0) scr_printf("[2a] SIO2MAN load failed: %d\n", sio2Ret);
+        const int padRet = SifLoadModule("rom0:PADMAN", 0, nullptr);
+        if (padRet  < 0) scr_printf("[2a] PADMAN load failed: %d\n", padRet);
+
         const int libsdRet = SifLoadModule("rom0:LIBSD", 0, nullptr);
         if (libsdRet < 0)
         {
@@ -189,6 +199,36 @@ int main(int argc, char** argv)
                     scr_printf("[2a] audsrv up (libsd=%d audsrv=%d init=%d size=%u)\n",
                                libsdRet, audsrvRet, audsrvInit, (unsigned)size_audsrv_irx);
                 }
+            }
+        }
+    }
+
+    // ---- Load memory-card IRX stack --------------------------------------
+    // MCMAN drives the SIO2 transactions to the memory card hardware, MCSERV
+    // is the EE-side RPC server. Both ROM-resident on every PS2 + PCSX2.
+    // mcInit(MC_TYPE_XMC) brings the libmc EE side online and is required
+    // before any mcOpen / mcRead / mcWrite call. MC_TYPE_XMC selects the
+    // newer xmcman/xmcserv ABI surface — backwards-compatible with classic
+    // mcman/mcserv so loading rom0:MCMAN works either way.
+    {
+        const int mcmanRet  = SifLoadModule("rom0:MCMAN",  0, nullptr);
+        const int mcservRet = SifLoadModule("rom0:MCSERV", 0, nullptr);
+        if (mcmanRet < 0 || mcservRet < 0)
+        {
+            scr_printf("[2b] MC IRX load failed (mcman=%d mcserv=%d) — saves offline\n",
+                       mcmanRet, mcservRet);
+        }
+        else
+        {
+            const int mcInitRet = mcInit(MC_TYPE_XMC);
+            if (mcInitRet < 0)
+            {
+                scr_printf("[2b] mcInit failed: %d — saves offline\n", mcInitRet);
+            }
+            else
+            {
+                scr_printf("[2b] libmc up (mcman=%d mcserv=%d mcInit=%d)\n",
+                           mcmanRet, mcservRet, mcInitRet);
             }
         }
     }

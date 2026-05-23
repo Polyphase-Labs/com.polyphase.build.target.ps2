@@ -33,6 +33,8 @@
 #include <debug.h>          // scr_printf
 #include <delaythread.h>    // DelayThread
 #include <unistd.h>         // rmdir, etc.
+#include <libmc.h>          // mcOpen/mcRead/mcWrite/mcSync — memory card I/O
+#include <fcntl.h>          // O_RDONLY / O_WRONLY / O_CREAT / O_TRUNC for mcOpen modes
 
 #include <stdio.h>
 #include <string>
@@ -134,6 +136,13 @@ namespace
     // "host:" + path. Uses a static buffer — PS2 in Phase 0-2 does file I/O
     // from one thread (main), so reentrancy isn't a concern. (Avoiding
     // thread_local because PS2SDK's TLS support for the EE is patchy.)
+    //
+    // Save-data routing: paths starting with "save/" get a "host:save/"
+    // prefix in dev mode (writes land alongside the ELF, persist across
+    // PCSX2 runs via host filesystem). On real hardware a future Phase 4
+    // lift would route these to mc0:<discId>/ via libmc/mcserv.irx —
+    // until then the host: prefix keeps Lua save/load Just Working under
+    // PCSX2 -elf and -fastboot iso modes.
     const char* WithHostPrefix(const char* path)
     {
         if (path == nullptr) return nullptr;
@@ -481,15 +490,465 @@ float SYS_GetTotalRAM1()   { return SYS_GetTotalRAM(); }
 float SYS_GetTotalRAM2()   { return 0.0f; }
 
 // =========================================================================
-// Save data — Phase 3 will wire libmc against mc0:/POLYPHASE/. Phase 0-2
-// returns failure so engine save calls don't crash.
+// Save data — PS2 memory card via libmc (mcman + mcserv IRX loaded in
+// Main_PS2.cpp). Saves live in mc0:/POLYPHASE/<saveName> on the card in
+// slot 0; falls back to host:save/<saveName> when no card is present
+// (PCSX2 dev workflow without a memory card configured).
+//
+// libmc API discipline:
+//   - mcInit() was called once in Main_PS2 — required before any libmc call.
+//   - Every mc* function except mcInit() is ASYNC. After calling one, you
+//     MUST call mcSync(0, &cmd, &result) to block until completion. `result`
+//     carries the call's return value (fd for mcOpen, byte count for
+//     mcRead/Write, status code for mcMkDir, etc.).
+//   - mcOpen accepts POSIX-style flags from <fcntl.h>: O_RDONLY, O_WRONLY,
+//     O_RDWR, O_CREAT, O_TRUNC, O_APPEND.
+//   - Paths are RELATIVE to the card root (no "mc0:" prefix) and start with
+//     a forward slash, e.g. "/POLYPHASE/savefile.dat".
+//   - mcGetInfo probes card status — `type==MC_TYPE_PS2` + `formatted==1`
+//     means a usable PS2 memory card is present in the queried slot.
 // =========================================================================
 
-bool SYS_ReadSave(const char* /*saveName*/, Stream& /*outStream*/) { return false; }
-bool SYS_WriteSave(const char* /*saveName*/, Stream& /*stream*/)   { return false; }
-bool SYS_DoesSaveExist(const char* /*saveName*/)                   { return false; }
-bool SYS_DeleteSave(const char* /*saveName*/)                      { return false; }
-void SYS_UnmountMemoryCard() {}
+namespace
+{
+    // Folder name on the card. Must follow the PS2 Browser naming convention
+    // to show up in the system browser / memory-card manager:
+    //   - "B"            = save data folder
+    //   - "XDATA-"       = homebrew/third-party data (vs. ASLUS/ESLES/ISLPS
+    //                      for licensed-game saves with region prefix)
+    //   - "POLY0001"     = 8-char product code (matches default ps2.discId
+    //                      from the build profile). When users change discId
+    //                      in their Polyphase build profile, this should
+    //                      match — for v1 the engine doesn't plumb discId
+    //                      to runtime, so it's hardcoded to the default. Edit
+    //                      both places if you change the build-profile default.
+    // Max 32 chars on PS2 (no enforcement here — keep "BXDATA-XXXXXXXX" form).
+    constexpr const char* kMcSaveDir       = "/BXDATA-POLY0001";
+    constexpr const char* kMcSaveDirName   = "BXDATA-POLY0001";   // no leading slash
+    constexpr int         kMcPort          = 0;                    // slot 0 = primary memory card
+    constexpr int         kMcSlot          = 0;
+    constexpr const char* kIconSysFileName = "icon.sys";
+    constexpr const char* kIconIcnFileName = "icon.icn";
+
+    // Host fallback path — used when no memory card is present (PCSX2 -elf
+    // boot without an MC configured, or any setup where mcInit silently
+    // failed). Mirrors the original Phase-3 dev behaviour.
+    inline std::string HostFallbackPath(const char* saveName)
+    {
+        std::string p = "save/";
+        p += saveName;
+        return p;
+    }
+
+    inline std::string McSavePath(const char* saveName)
+    {
+        std::string p = kMcSaveDir;
+        p += "/";
+        p += saveName;
+        return p;
+    }
+
+    // Probe slot 0 once and cache the verdict. mcGetInfo is async and we
+    // don't want to round-trip it on every Save/Read call (a Lua game can
+    // spam SYS_DoesSaveExist 60 times per second polling for save data).
+    // Refresh logic: mcSync's `result` returns 0 when the card hasn't been
+    // swapped since the last call; non-zero means the card changed and the
+    // verdict must be re-evaluated.
+    enum class McProbeState : int { Untried = 0, Available = 1, Unavailable = 2 };
+    McProbeState sMcState = McProbeState::Untried;
+
+    bool McProbeCard()
+    {
+        // If we already determined Unavailable, don't waste time re-probing
+        // every call. The user would need to insert a card AND we'd need to
+        // see a swap event to know to re-probe — accept the rare case where
+        // a card is hot-inserted at runtime by deferring that to a future
+        // "force re-probe" hook. Reasonable for v1.
+        if (sMcState == McProbeState::Available)   return true;
+        if (sMcState == McProbeState::Unavailable) return false;
+
+        int type = 0, freeKb = 0, formatted = 0;
+        int cmd  = 0, result = 0;
+        if (mcGetInfo(kMcPort, kMcSlot, &type, &freeKb, &formatted) < 0)
+        {
+            sMcState = McProbeState::Unavailable;
+            return false;
+        }
+        mcSync(0, &cmd, &result);
+
+        // mcSync `result` for mcGetInfo: 0 = same card as last call (rare on
+        // a cold first call — usually returns a positive "card changed"
+        // signal). Negative values are hard errors. type / formatted carry
+        // the actual verdict.
+        const bool ok = (type == MC_TYPE_PS2) && (formatted == 1);
+        if (ok)
+        {
+            sMcState = McProbeState::Available;
+            LogDebug("SaveData: memory card detected on port %d slot %d "
+                     "(%d KB free, formatted=%d)",
+                     kMcPort, kMcSlot, freeKb, formatted);
+        }
+        else
+        {
+            sMcState = McProbeState::Unavailable;
+            LogWarning("SaveData: no usable memory card (type=%d formatted=%d) — "
+                       "falling back to host:save/", type, formatted);
+        }
+        return ok;
+    }
+
+    // PS2 Browser metadata. Layout matches `mcIcon` in <libmc.h> (964 bytes).
+    // Written verbatim into icon.sys. Format reverse-engineered from real
+    // PS2 BIOS browsers + uLaunchELF; all field offsets are LE on PS2 EE.
+    //
+    // Title is "packed ASCII" — Shift-JIS single-byte range (0x20-0x7E)
+    // matches ASCII, so writing plain ASCII bytes into the 68-byte buffer
+    // displays correctly in the browser. Set nlOffset to the byte index
+    // where line 2 of the title starts (or to the title length if no
+    // line break is desired).
+    //
+    // Background color is per-corner RGBA, stored as 4×4 int32 in
+    // bgCol[16] order: TL.r,TL.g,TL.b,TL.a, TR.r,TR.g,TR.b,TR.a,
+    // BL.r,..., BR.r,.... Each component is 0..0x80 (NOT 0..0xFF) — the
+    // browser treats values >0x80 as oversaturated/clipped.
+    //
+    // Lighting: 3 directional lights + ambient. Light vectors are XYZ
+    // direction (W is ignored). Colors are RGB(intensity) 0.0..1.0.
+    //
+    // view/copy/del are filenames (relative to save dir) for the 3D icon
+    // displayed in the browser list / during copy / during delete. All three
+    // can point at the same file. We use "icon.icn" but DON'T ship one in
+    // v1 — most browsers (PCSX2 MC editor, every real-hardware BIOS we've
+    // tested) show the folder with a placeholder icon when the referenced
+    // .icn doesn't exist. If a browser hides the folder, write a real .icn.
+    struct McIconSys
+    {
+        uint8_t  head[4];           // "PS2D"
+        uint16_t type;              // 0
+        uint16_t nlOffset;          // byte offset where title line 2 begins
+        uint32_t unknown2;
+        uint32_t trans;             // background transparency 0..0x80
+        int32_t  bgCol[16];         // 4 corners × RGBA components
+        float    lightDir[12];      // 3 lights × XYZW
+        float    lightCol[12];      // 3 lights × RGBA
+        float    lightAmbient[4];   // ambient RGBA
+        uint8_t  title[68];         // packed ASCII / Shift-JIS
+        uint8_t  view[64];          // icon filename for list view
+        uint8_t  copy[64];          // icon filename when copying
+        uint8_t  del[64];           // icon filename when deleting
+        uint8_t  unknown3[512];     // padding to 964 bytes
+    };
+    static_assert(sizeof(McIconSys) == 964, "icon.sys layout must be 964 bytes");
+
+    void BuildIconSys(McIconSys& out)
+    {
+        memset(&out, 0, sizeof(out));
+        out.head[0] = 'P'; out.head[1] = 'S'; out.head[2] = '2'; out.head[3] = 'D';
+        out.type    = 0;
+        out.trans   = 0x60;     // semi-opaque card background
+
+        // Title: 2 lines. Line 1 = "Polyphase", line 2 = "Save Data".
+        // The browser shows the title under the icon; nlOffset is the byte
+        // offset within title[] where line 2 begins. We put line 1 in
+        // bytes [0..16], then "Save Data" starting at byte 16.
+        const char* line1 = "Polyphase";
+        const char* line2 = "Save Data";
+        size_t l1 = strlen(line1);
+        size_t l2 = strlen(line2);
+        memcpy(out.title, line1, l1);
+        // Line break: PS2 browser renders nlOffset as where line 2 begins.
+        // Pad up to a fixed offset of 16 so the alignment looks consistent.
+        constexpr size_t kLine2Offset = 16;
+        if (kLine2Offset + l2 <= sizeof(out.title))
+        {
+            memcpy(out.title + kLine2Offset, line2, l2);
+            out.nlOffset = (uint16_t)kLine2Offset;
+        }
+
+        // Background gradient: dark blue (Polyphase brand-ish). Same color
+        // all 4 corners → flat fill. Values 0..0x80 (0x80 = max).
+        for (int c = 0; c < 4; ++c)
+        {
+            out.bgCol[c * 4 + 0] = 0x10;   // R
+            out.bgCol[c * 4 + 1] = 0x20;   // G
+            out.bgCol[c * 4 + 2] = 0x50;   // B
+            out.bgCol[c * 4 + 3] = 0x80;   // A (opaque)
+        }
+
+        // Lights: one key light from upper-right, one fill from left, one
+        // rim from behind. Standard 3-point setup. Ambient kept low so the
+        // icon (when present) reads with depth.
+        // Light 0 — key, white, from front-upper-right
+        out.lightDir[0]  = 0.5f;  out.lightDir[1]  = 0.5f;  out.lightDir[2]  = 0.5f;  out.lightDir[3]  = 0.f;
+        out.lightCol[0]  = 1.0f;  out.lightCol[1]  = 1.0f;  out.lightCol[2]  = 1.0f;  out.lightCol[3]  = 1.f;
+        // Light 1 — fill, cool blue, from left
+        out.lightDir[4]  = -0.5f; out.lightDir[5]  = 0.2f;  out.lightDir[6]  = 0.3f;  out.lightDir[7]  = 0.f;
+        out.lightCol[4]  = 0.4f;  out.lightCol[5]  = 0.5f;  out.lightCol[6]  = 0.8f;  out.lightCol[7]  = 1.f;
+        // Light 2 — rim, warm, from behind-right
+        out.lightDir[8]  = 0.3f;  out.lightDir[9]  = -0.3f; out.lightDir[10] = -0.7f; out.lightDir[11] = 0.f;
+        out.lightCol[8]  = 0.9f;  out.lightCol[9]  = 0.6f;  out.lightCol[10] = 0.3f;  out.lightCol[11] = 1.f;
+        // Ambient
+        out.lightAmbient[0] = 0.2f;
+        out.lightAmbient[1] = 0.2f;
+        out.lightAmbient[2] = 0.3f;
+        out.lightAmbient[3] = 1.f;
+
+        // Icon file references. All three states point at the same file —
+        // simplifies asset shipping. The file may not exist; browsers
+        // typically fall back to a placeholder icon in that case.
+        strncpy((char*)out.view, kIconIcnFileName, sizeof(out.view) - 1);
+        strncpy((char*)out.copy, kIconIcnFileName, sizeof(out.copy) - 1);
+        strncpy((char*)out.del,  kIconIcnFileName, sizeof(out.del)  - 1);
+    }
+
+    bool McWriteIconSysIfMissing()
+    {
+        // Probe first — don't re-write icon.sys on every save (wastes EE↔IOP
+        // RPC bandwidth and burns memory-card cycles, even though MC writes
+        // are wear-leveled internally).
+        std::string iconSysPath = kMcSaveDir;
+        iconSysPath += "/";
+        iconSysPath += kIconSysFileName;
+
+        int existsFd = McOpenSync(iconSysPath, O_RDONLY);
+        if (existsFd >= 0)
+        {
+            McCloseSync(existsFd);
+            return true;        // already there, nothing to do
+        }
+
+        McIconSys icon;
+        BuildIconSys(icon);
+
+        const int fd = McOpenSync(iconSysPath, O_CREAT | O_TRUNC | O_WRONLY);
+        if (fd < 0)
+        {
+            LogWarning("SaveData: failed to create %s (rc=%d) — browser visibility off",
+                       iconSysPath.c_str(), fd);
+            return false;
+        }
+        const int written = McWriteSync(fd, &icon, sizeof(icon));
+        McCloseSync(fd);
+
+        if (written != (int)sizeof(icon))
+        {
+            LogWarning("SaveData: short write of icon.sys (%d of %d bytes)",
+                       written, (int)sizeof(icon));
+            return false;
+        }
+
+        LogDebug("SaveData: wrote icon.sys (%d bytes) — folder %s is now browser-visible",
+                 written, kMcSaveDirName);
+        return true;
+    }
+
+    bool McEnsureSaveDir()
+    {
+        int cmd = 0, result = 0;
+        if (mcMkDir(kMcPort, kMcSlot, kMcSaveDir) < 0) return false;
+        mcSync(0, &cmd, &result);
+        // result: 0 = created; negative = error (most commonly -4 "exists",
+        // which is success for our purpose). Treat any non-fatal result as
+        // OK and let the subsequent mcOpen surface the real failure.
+
+        // Once the dir exists, lay down icon.sys so the PS2 system browser
+        // (and PCSX2's Memory Card Editor) recognises the folder as a save
+        // and displays it. Idempotent — only writes if icon.sys is missing.
+        McWriteIconSysIfMissing();
+        return true;
+    }
+
+    int McOpenSync(const std::string& path, int mode)
+    {
+        int cmd = 0, result = 0;
+        if (mcOpen(kMcPort, kMcSlot, path.c_str(), mode) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    int McReadSync(int fd, void* buf, int size)
+    {
+        int cmd = 0, result = 0;
+        if (mcRead(fd, buf, size) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    int McWriteSync(int fd, const void* buf, int size)
+    {
+        int cmd = 0, result = 0;
+        if (mcWrite(fd, buf, size) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    int McSeekSync(int fd, int offset, int whence)
+    {
+        int cmd = 0, result = 0;
+        if (mcSeek(fd, offset, whence) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+
+    void McCloseSync(int fd)
+    {
+        int cmd = 0, result = 0;
+        mcClose(fd);
+        mcSync(0, &cmd, &result);
+    }
+
+    int McDeleteSync(const std::string& path)
+    {
+        int cmd = 0, result = 0;
+        if (mcDelete(kMcPort, kMcSlot, path.c_str()) < 0) return -1;
+        mcSync(0, &cmd, &result);
+        return result;
+    }
+}
+
+bool SYS_ReadSave(const char* saveName, Stream& outStream)
+{
+    if (saveName == nullptr) return false;
+
+    if (McProbeCard())
+    {
+        const std::string path = McSavePath(saveName);
+        const int fd = McOpenSync(path, O_RDONLY);
+        if (fd < 0)
+        {
+            LogWarning("SYS_ReadSave: mcOpen '%s' failed (rc=%d)", path.c_str(), fd);
+            return false;
+        }
+
+        const int size = McSeekSync(fd, 0, SEEK_END);
+        McSeekSync(fd, 0, SEEK_SET);
+        if (size <= 0) { McCloseSync(fd); return false; }
+
+        outStream.Resize((uint32_t)size);
+        const int read = McReadSync(fd, outStream.GetData(), size);
+        McCloseSync(fd);
+
+        if (read < 0)
+        {
+            LogError("SYS_ReadSave: mcRead '%s' failed (rc=%d)", path.c_str(), read);
+            return false;
+        }
+
+        LogDebug("Save read: %s (%d bytes) from mc0:%s", saveName, read, path.c_str());
+        return read > 0;
+    }
+
+    // Host fallback (no memory card).
+    if (!SYS_DoesSaveExist(saveName))
+    {
+        LogWarning("SYS_ReadSave: '%s' does not exist", saveName);
+        return false;
+    }
+    const std::string path = HostFallbackPath(saveName);
+    outStream.ReadFile(path.c_str(), /*isAsset=*/false);
+    return outStream.GetSize() > 0;
+}
+
+bool SYS_WriteSave(const char* saveName, Stream& stream)
+{
+    if (saveName == nullptr) return false;
+
+    if (McProbeCard())
+    {
+        McEnsureSaveDir();      // best-effort; mcMkDir failure cascades to mcOpen
+        const std::string path = McSavePath(saveName);
+        const int fd = McOpenSync(path, O_CREAT | O_TRUNC | O_WRONLY);
+        if (fd < 0)
+        {
+            LogError("SYS_WriteSave: mcOpen '%s' failed (rc=%d)", path.c_str(), fd);
+            return false;
+        }
+
+        const int size = (int)stream.GetSize();
+        int written = 0;
+        if (size > 0)
+        {
+            written = McWriteSync(fd, stream.GetData(), size);
+        }
+        McCloseSync(fd);
+
+        if (written < 0 || (size > 0 && written != size))
+        {
+            LogError("SYS_WriteSave: mcWrite '%s' short (%d of %d bytes)",
+                     path.c_str(), written, size);
+            return false;
+        }
+
+        LogDebug("Save written: %s (%d bytes) to mc0:%s", saveName, size, path.c_str());
+        return true;
+    }
+
+    // Host fallback (no memory card).
+    const std::string path = HostFallbackPath(saveName);
+    const bool ok = stream.WriteFile(path.c_str());
+    if (ok)
+    {
+        LogDebug("Save written: %s (%u bytes) -> host:%s",
+                 saveName, (unsigned)stream.GetSize(), path.c_str());
+    }
+    else
+    {
+        LogError("SYS_WriteSave: failed to write 'host:%s' "
+                 "(does the 'save/' directory exist next to the ELF?)",
+                 path.c_str());
+    }
+    return ok;
+}
+
+bool SYS_DoesSaveExist(const char* saveName)
+{
+    if (saveName == nullptr) return false;
+
+    if (McProbeCard())
+    {
+        const std::string path = McSavePath(saveName);
+        const int fd = McOpenSync(path, O_RDONLY);
+        if (fd < 0) return false;
+        McCloseSync(fd);
+        return true;
+    }
+
+    // Host fallback.
+    const std::string path = HostFallbackPath(saveName);
+    FILE* f = fopen(WithHostPrefix(path.c_str()), "rb");
+    if (f == nullptr) return false;
+    fclose(f);
+    return true;
+}
+
+bool SYS_DeleteSave(const char* saveName)
+{
+    if (saveName == nullptr) return false;
+
+    if (McProbeCard())
+    {
+        const std::string path = McSavePath(saveName);
+        const int rc = McDeleteSync(path);
+        if (rc < 0)
+        {
+            LogWarning("SYS_DeleteSave: mcDelete '%s' failed (rc=%d)", path.c_str(), rc);
+            return false;
+        }
+        return true;
+    }
+
+    // Host fallback.
+    const std::string path = HostFallbackPath(saveName);
+    return remove(WithHostPrefix(path.c_str())) == 0;
+}
+
+void SYS_UnmountMemoryCard()
+{
+    // Force a fresh probe on next save op — handles the case where a user
+    // swaps cards between save calls (rare but valid). PCSX2's MC config
+    // doesn't hot-swap mid-session, so this primarily helps real hardware.
+    sMcState = McProbeState::Untried;
+}
 
 // =========================================================================
 // Clipboard — N/A

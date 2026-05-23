@@ -282,7 +282,7 @@ EE_LIBDIR = -L$(PS2SDK)/ports/lib -L$(PS2SDK)/ee/lib -L$(PS2DEV)/gsKit/lib $(add
 EE_LDFLAGS = $(EE_LIBDIR) -Wl,--allow-multiple-definition
 EE_LIBS = \
     -lgskit_toolkit -lgskit -ldmakit \
-    -laudsrv \
+    -laudsrv -lpad -lmc \
     -lfileXio -lpatches -ldebug \
     -lm -lc -lkernel -latomic \
     $(addprefix -l,$(ADDON_LIBS))

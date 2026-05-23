@@ -35,7 +35,7 @@
 
 #include <kernel.h>
 #include <audsrv.h>
-#include <debug.h>       // scr_printf — IOP tty diagnostic, bypasses host: log buffering
+#include <unistd.h>     // usleep — PS2SDK newlib provides this
 
 #include <stdlib.h>
 #include <string.h>
@@ -47,15 +47,9 @@ namespace
     constexpr int kFramesPerBuffer    = 1024;          // ~23 ms @ 44.1 kHz
     constexpr int kSamplesPerBuffer   = kFramesPerBuffer * 2;  // stereo
     constexpr int kBytesPerBuffer     = kSamplesPerBuffer * 2; // S16
-    // Master attenuation: was 0.5 (mirrors PSP) for clipping headroom
-    // when N voices sum into one s32 lane. But the actual content we get
-    // from the engine is already quiet — star_map_menu2 peaks at ~12% of
-    // 8-bit full scale, then engine adds a 33% spatial multiplier, so a
-    // 0.5 master kills another 2x → output ends up at ~2% s16 amplitude
-    // which is inaudible through PCSX2's audio backend. Drop master to
-    // 1.0 (no attenuation). The mixer still saturates per-sample so
-    // multi-voice clipping is safe; we just don't pre-attenuate.
-    constexpr float kMasterAtten      = 1.0f;
+    // Per-voice base attenuation — mirrors PSP's 0.5 (6 dB headroom).
+    // The post-mix limiter below handles multi-voice clipping dynamically.
+    constexpr float kMasterAtten      = 0.5f;
 
     struct Ps2Voice
     {
@@ -73,7 +67,12 @@ namespace
         uint8_t         numChannels   = 1;
         uint8_t         bitsPerSample = 16;
         bool            loop          = false;
-        volatile double positionFrac  = 0.0;
+        // positionFrac is mixer-thread-private — engine threads only set it
+        // to 0.0 inside AUD_Play under the lock. No need for volatile, and
+        // marking volatile forces every += through memory which on PS2's
+        // non-IEC559 FPU was producing wonky comparisons (voice never
+        // reaching numFrames cleanly → one-shot sounds looping forever).
+        double          positionFrac  = 0.0;
         double          rate          = 1.0;
         int32_t         leftVolQ15    = 32768;
         int32_t         rightVolQ15   = 32768;
@@ -102,7 +101,6 @@ namespace
 
     static int      sVoiceLock    = -1;
     static int      sMixerThread  = -1;
-    static volatile int32_t sLastMixPeak = 0;
     static u8       sMixerStack[16 * 1024] __attribute__((aligned(16)));
     static volatile bool sMixerRun    = false;
     static bool          sAudsrvUp    = false;
@@ -169,58 +167,7 @@ namespace
     {
         memset(sMixBuffer, 0, sizeof(sMixBuffer));
 
-        // CRITICAL: read voice 0 state UNDER the lock (this guarantees
-        // a fresh load from memory — the compiler can't cache through
-        // the WaitSema/SignalSema fence).
         WaitSema(sVoiceLock);
-        const bool voice0Active   = sVoices[0].active;
-        const bool voice0Advanced = sVoices[0].positionFrac > 1.0;
-        const uint32_t voice0Pos  = (uint32_t)sVoices[0].positionFrac;
-        // Don't release lock yet — voice mixing also needs it. Inline the
-        // buzz first (no shared state), then run the voice mixing below
-        // still under the same lock acquisition.
-
-        // AUDIBLE DIAGNOSTIC — buzz pitch encodes voice state:
-        //   220 Hz constant hum         → voice 0 INACTIVE the whole time
-        //   880 Hz constant tone        → voice 0 active, positionFrac stuck at 0
-        //   Sliding pitch 220→2200 Hz   → voice 0 active AND positionFrac
-        //                                 advancing through PCM (good!)
-        // The sliding tone proves the mixer is processing samples.
-        int buzzHz = 220;
-        if (voice0Active && voice0Advanced)
-        {
-            // Map positionFrac (0..numFrames) to pitch (220..2200 Hz).
-            // For numFrames=1.4M, voice0Pos increments by 1024 per mixer
-            // iter — pitch should slide audibly over a few seconds.
-            const uint32_t maxPos = sVoices[0].numFrames > 0
-                                      ? sVoices[0].numFrames : 1u;
-            const uint32_t ratioK = (voice0Pos * 1024u) / maxPos;  // 0..1024
-            buzzHz = 220 + (int)((ratioK * 1980u) / 1024u);        // 220..2200
-        }
-        else if (voice0Active)
-        {
-            buzzHz = 880;
-        }
-        const int phasePeriod = kOutputRate / buzzHz / 2;
-        static uint32_t sBuzzPhase = 0;
-        for (int f = 0; f < kFramesPerBuffer; ++f)
-        {
-            const int32_t squareSample = ((sBuzzPhase / phasePeriod) & 1) ? 8000 : -8000;
-            sMixBuffer[f * 2 + 0] += squareSample;
-            sMixBuffer[f * 2 + 1] += squareSample;
-            ++sBuzzPhase;
-        }
-
-        // Use scr_printf for one-shot diagnostic so it goes straight to
-        // PCSX2's IOP console (which we can see in the user's screenshot)
-        // without the host: file buffering delay. Fire on every 30th iter.
-        static int sScrTick = 0;
-        if (++sScrTick >= 30)
-        {
-            sScrTick = 0;
-            scr_printf("[MX] v0a=%d pos=%u peak=%ld\n",
-                       (int)voice0Active, voice0Pos, (long)sLastMixPeak);
-        }
 
         for (uint32_t vi = 0; vi < AUDIO_MAX_VOICES; ++vi)
         {
@@ -271,77 +218,64 @@ namespace
 
         SignalSema(sVoiceLock);
 
-        // Track peak amplitude of the post-mix buffer so the heartbeat
-        // can show whether voices are actually contributing. With the
-        // 220 Hz buzz baseline, peak should sit at ~10000 when no voice
-        // is playing. If BossMain mixes in, peak should jump to ~31000+
-        // (its peak amplitude). If voices are silently failing to mix,
-        // peak stays at ~10000.
-        int32_t peakSample = 0;
+        // Post-mix limiter. With AUDIO_MAX_VOICES=8 the engine can stack
+        // up to 8 voices summing into one s32 lane. A static kMasterAtten
+        // can't both (a) make single voices loud enough to hear and
+        // (b) leave headroom for 8 voices. Solution: scan the mix buffer
+        // for the peak amplitude; if it exceeds s16 range, scale ALL
+        // samples down so the peak lands exactly at +/-32767. Single-voice
+        // gets full kMasterAtten loudness; rapid-fire SFX (e.g. 6 rapid
+        // clicks of the same sound) stack without hard-clipping into
+        // odd-harmonic distortion. (Hard clip sounded like rising pitch
+        // because odd harmonics stack on top of the fundamental.)
+        //
+        // Simple per-buffer normalize — may pump on transients, but no
+        // hard clip. Pumping is inaudible at small voice counts (which
+        // is the common case).
+        int32_t peakMag = 0;
         for (int i = 0; i < kSamplesPerBuffer; ++i)
         {
-            const int32_t mag = sMixBuffer[i] < 0 ? -sMixBuffer[i] : sMixBuffer[i];
-            if (mag > peakSample) peakSample = mag;
+            const int32_t m = sMixBuffer[i] < 0 ? -sMixBuffer[i] : sMixBuffer[i];
+            if (m > peakMag) peakMag = m;
+        }
+        if (peakMag > 32767)
+        {
+            // Q15 inverse-gain so we keep integer arithmetic in the hot loop.
+            const int32_t gainQ15 = (int32_t)((32767LL << 15) / peakMag);
+            for (int i = 0; i < kSamplesPerBuffer; ++i)
+            {
+                sMixBuffer[i] = (int32_t)((int64_t(sMixBuffer[i]) * gainQ15) >> 15);
+            }
+        }
+
+        for (int i = 0; i < kSamplesPerBuffer; ++i)
+        {
             sOutBuffer[i] = (int16_t)SaturateS16(sMixBuffer[i]);
         }
-        sLastMixPeak = peakSample;
     }
 
     void MixerThread(void* /*arg*/)
     {
-        LogDebug("[PS2 AUD] MixerThread entered");
-        // Heartbeat counter so we can verify the mixer thread is actually
-        // running + submitting buffers to audsrv.
-        int hb = 0;
-        int verboseLeft = 5;   // log first 5 iterations in full detail
+        // 1024 frames @ 44100 Hz = 23.2 ms of audio per buffer. We sleep
+        // slightly SHORTER than that (20 ms) so the mixer stays a bit
+        // ahead of consumption — gives audsrv a small frame of headroom
+        // and avoids underrun-then-overrun oscillation. Symptom that
+        // diagnoses an over-fast mixer: audio plays once then loops the
+        // last buffer indefinitely (audsrv's ring drained, SPU2 repeats
+        // its last received block).
+        //
+        // usleep arg is microseconds. PS2SDK's newlib routes this through
+        // SetAlarm + SleepThread internally — no busy-wait, the EE is
+        // free to run other threads during the sleep.
+        constexpr useconds_t kMixerSleepUs = 20 * 1000;
         while (sMixerRun)
         {
-            if (verboseLeft > 0)
-            {
-                LogDebug("[PS2 AUD] mixer iter: calling wait_audio(%d)", kBytesPerBuffer);
-            }
-            const int waitRet = audsrv_wait_audio(kBytesPerBuffer);
-            if (verboseLeft > 0)
-            {
-                LogDebug("[PS2 AUD] wait_audio returned %d", waitRet);
-            }
             MixOneBuffer();
-            const int playRet = audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
-            if (verboseLeft > 0)
-            {
-                LogDebug("[PS2 AUD] play_audio returned %d (wanted %d)", playRet, kBytesPerBuffer);
-                verboseLeft--;
-            }
-            if (++hb >= 30)   // ~0.7 sec @ 23ms/buf
-            {
-                hb = 0;
-                int activeVoices = 0;
-                int activeStreams = 0;
-                for (int i = 0; i < AUDIO_MAX_VOICES; ++i)
-                {
-                    if (sVoices[i].active) ++activeVoices;
-                }
-                for (uint32_t i = 0; i < kMaxStreams; ++i)
-                {
-                    if (sStreams[i].inUse) ++activeStreams;
-                }
-                // Also dump voice 0's runtime state so we can see if it's
-                // active, where its playhead is, and what its volume is at.
-                const Ps2Voice& v0 = sVoices[0];
-                LogDebug("[PS2 AUD] mixer alive: %d voices, %d streams, lastPeak=%ld | v0: active=%d pos=%u/%u volQ15=%d/%d bps=%d ch=%d rate=%.3f pcm=%p",
-                         activeVoices, activeStreams, (long)sLastMixPeak,
-                         (int)v0.active,
-                         (unsigned)v0.positionFrac, v0.numFrames,
-                         v0.leftVolQ15, v0.rightVolQ15,
-                         v0.bitsPerSample, v0.numChannels,
-                         v0.rate, v0.pcmData);
-            }
+            audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
+            usleep(kMixerSleepUs);
         }
-
-        // Drain — submit one silent buffer so we don't loop the last sample.
         memset(sOutBuffer, 0, sizeof(sOutBuffer));
         audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
-
         ExitThread();
     }
 
@@ -471,36 +405,15 @@ void AUD_Play(uint32_t voiceIndex, SoundWave* soundWave, float volume,
     const uint32_t numFrames = soundWave->GetNumSamples();
     if (pcm == nullptr || numFrames == 0) return;
 
-    LogDebug("[PS2 AUD] AUD_Play voice=%u name='%s' frames=%u rate=%u ch=%u bps=%u vol=%.2f pitch=%.2f loop=%d",
-             voiceIndex, soundWave->GetName().c_str(), numFrames,
-             soundWave->GetSampleRate(), soundWave->GetNumChannels(),
-             soundWave->GetBitsPerSample(), volume, pitch, (int)loop);
-    // Dump bytes at 4 offsets across the buffer. Silence = 0x80 in 8-bit
-    // unsigned PCM. If ALL offsets are 0x80 the buffer is empty silence;
-    // if ONLY the start is 0x80 the audio just has an intro fade-in; if
-    // mid+end vary the data is real and the silence is just the lead-in.
-    auto dump8 = [&](uint32_t off) {
-        if (off + 8 > numFrames) return;
-        LogDebug("[PS2 AUD]   pcm[%u..%u]= %02X %02X %02X %02X  %02X %02X %02X %02X",
-                 off, off+7,
-                 pcm[off+0], pcm[off+1], pcm[off+2], pcm[off+3],
-                 pcm[off+4], pcm[off+5], pcm[off+6], pcm[off+7]);
-    };
-    dump8(0);
-    dump8(numFrames / 8);             // ~12% through
-    dump8(numFrames / 2);             // 50%
-    dump8(numFrames - 16);            // near end
-    // Quick non-silence scan: count bytes in first 4 KB that differ from
-    // the 0x80 midpoint. If 0, the buffer is solid silence.
+    // Log Play calls so we can verify the engine passes loop=false for SFX.
+    // Capped to first 30 to avoid log spam on busy SFX scenes.
+    static int sPlayLog = 0;
+    if (sPlayLog < 30)
     {
-        uint32_t scanLen = numFrames < 4096u ? numFrames : 4096u;
-        uint32_t nonSilent = 0;
-        for (uint32_t i = 0; i < scanLen; ++i)
-        {
-            if (pcm[i] != 0x80) ++nonSilent;
-        }
-        LogDebug("[PS2 AUD]   non-silent bytes in first %u: %u",
-                 scanLen, nonSilent);
+        LogDebug("[PS2 AUD] AUD_Play v=%u name='%s' frames=%u rate=%u pitch=%.2f loop=%d vol=%.2f",
+                 voiceIndex, soundWave->GetName().c_str(), numFrames,
+                 soundWave->GetSampleRate(), pitch, (int)loop, volume);
+        ++sPlayLog;
     }
 
     WaitSema(sVoiceLock);
@@ -512,29 +425,24 @@ void AUD_Play(uint32_t voiceIndex, SoundWave* soundWave, float volume,
     v.bitsPerSample   = (uint8_t)soundWave->GetBitsPerSample();
     v.loop            = loop;
     v.positionFrac    = 0.0;
+    // Clamp pitch to a sane range so a runaway value (NaN, negative,
+    // very large) can't either freeze the voice (rate=0) or read garbage
+    // past the buffer end at hyper-fast playback (rate >> 1).
+    float safePitch = pitch;
+    if (!(safePitch > 0.01f) || safePitch > 8.0f) safePitch = 1.0f;
     v.rate            = (v.sampleRate > 0)
-                          ? ((double)v.sampleRate * (double)pitch / (double)kOutputRate)
+                          ? ((double)v.sampleRate * (double)safePitch / (double)kOutputRate)
                           : 1.0;
     const int32_t vq15 = ClampVolQ15(volume);
     v.leftVolQ15      = vq15;
     v.rightVolQ15     = vq15;
     v.active          = true;
     SignalSema(sVoiceLock);
-    LogDebug("[PS2 AUD] AUD_Play DONE voice=%u active-now=%d pcm=%p numFrames=%u",
-             voiceIndex, (int)sVoices[voiceIndex].active,
-             sVoices[voiceIndex].pcmData, sVoices[voiceIndex].numFrames);
 }
 
 void AUD_Stop(uint32_t voiceIndex)
 {
     if (voiceIndex >= AUDIO_MAX_VOICES || sVoiceLock < 0) return;
-    static int sStopLog = 0;
-    if (sStopLog < 20)
-    {
-        LogDebug("[PS2 AUD] AUD_Stop voice=%u (was active=%d)",
-                 voiceIndex, (int)sVoices[voiceIndex].active);
-        ++sStopLog;
-    }
     WaitSema(sVoiceLock);
     sVoices[voiceIndex].active = false;
     SignalSema(sVoiceLock);
@@ -549,16 +457,6 @@ bool AUD_IsPlaying(uint32_t voiceIndex)
 void AUD_SetVolume(uint32_t voiceIndex, float leftVolume, float rightVolume)
 {
     if (voiceIndex >= AUDIO_MAX_VOICES || sVoiceLock < 0) return;
-    // Log every SetVolume — if the engine's spatial-audio path is
-    // computing 0/0 here (listener too far from source, etc.), the voice
-    // goes silent without us seeing it in AUD_Play.
-    static int sSetVolLog = 0;
-    if (sSetVolLog < 20)
-    {
-        LogDebug("[PS2 AUD] AUD_SetVolume voice=%u L=%.3f R=%.3f",
-                 voiceIndex, leftVolume, rightVolume);
-        ++sSetVolLog;
-    }
     WaitSema(sVoiceLock);
     sVoices[voiceIndex].leftVolQ15  = ClampVolQ15(leftVolume);
     sVoices[voiceIndex].rightVolQ15 = ClampVolQ15(rightVolume);

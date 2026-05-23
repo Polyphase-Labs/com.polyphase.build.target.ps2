@@ -45,6 +45,10 @@
 #include "Engine/Nodes/Widgets/Text.h"
 #include "Engine/Nodes/Widgets/Poly.h"
 #include "Engine/Nodes/Widgets/Widget.h"
+#include "Engine/Nodes/3D/TileMap2d.h"
+#include "Engine/Nodes/3D/Terrain3d.h"
+#include "Engine/Nodes/3D/Voxel3d.h"
+#include "Engine/Nodes/3D/TextMesh3d.h"
 #include "Maths.h"      // glm::perspective, glm::ortho, glm::radians
 #include "Log.h"
 
@@ -1027,26 +1031,277 @@ void GFX_DrawInstancedMeshComp(InstancedMesh3D* comp)
 }
 
 // ----- 3D text mesh -------------------------------------------------------
-void GFX_CreateTextMeshCompResource(TextMesh3D* /*c*/) {}
-void GFX_DestroyTextMeshCompResource(TextMesh3D* /*c*/) {}
-void GFX_UpdateTextMeshCompVertexBuffer(TextMesh3D* /*c*/, const std::vector<Vertex>& /*vertices*/) {}
-void GFX_DrawTextMeshComp(TextMesh3D* /*c*/) {}
+// ----- TextMesh3D (3D-in-world text geometry) -----------------------------
+// Engine extrudes the font glyphs as actual 3D meshes (TextMesh3D, distinct
+// from the 2D UI Text widget). Hands us a Vertex array (full pos/normal/uv
+// layout). We reuse DrawTrisHelper with a synthesized identity-indices
+// list since the verts already come in triangle-list order.
+
+namespace
+{
+    struct Ps2TextMeshData
+    {
+        std::vector<Vertex>     mVerts;
+        std::vector<IndexType>  mIndices;   // 0,1,2,3,...,N-1
+    };
+    std::unordered_map<TextMesh3D*, Ps2TextMeshData> sTextMeshes;
+}
+
+void GFX_CreateTextMeshCompResource(TextMesh3D* c)
+{
+    if (c == nullptr) return;
+    sTextMeshes[c];
+}
+void GFX_DestroyTextMeshCompResource(TextMesh3D* c)
+{
+    if (c == nullptr) return;
+    sTextMeshes.erase(c);
+}
+void GFX_UpdateTextMeshCompVertexBuffer(TextMesh3D* c,
+                                         const std::vector<Vertex>& vertices)
+{
+    if (c == nullptr) return;
+    auto& d = sTextMeshes[c];
+    d.mVerts = vertices;
+    // Sequential indices 0..N-1 — engine emits triangle-list ordered verts.
+    const uint32_t n = (uint32_t)vertices.size();
+    d.mIndices.resize(n);
+    for (uint32_t i = 0; i < n; ++i) d.mIndices[i] = (IndexType)i;
+}
+void GFX_DrawTextMeshComp(TextMesh3D* c)
+{
+    if (sGsGlobal == nullptr || c == nullptr) return;
+    auto it = sTextMeshes.find(c);
+    if (it == sTextMeshes.end() || it->second.mIndices.empty()) return;
+
+    World* world = GetWorld(0);
+    if (world == nullptr) return;
+    Camera3D* camera = world->GetActiveCamera();
+    if (camera == nullptr) return;
+
+    const glm::mat4 model = c->GetRenderTransform();
+    const glm::mat4 mvp   = camera->GetViewProjectionMatrix() * model;
+
+    Material* matBase = c->GetMaterial();
+    MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+    Ps2TextureData* texSlot = nullptr;
+    if (mat != nullptr && mat->GetTexture(0) != nullptr)
+    {
+        auto texIt = sTextures.find(mat->GetTexture(0));
+        if (texIt != sTextures.end()) texSlot = &texIt->second;
+    }
+
+    PointLightish light = GatherMainLight(world);
+    DrawTrisHelper(it->second.mVerts, it->second.mIndices,
+                   model, mvp, texSlot, light,
+                   /*unlit=*/false, /*invertCull=*/false);
+}
 
 // ----- Voxel / Terrain / TileMap -----------------------------------------
-void GFX_CreateVoxel3DResource(Voxel3D* /*v*/) {}
-void GFX_DestroyVoxel3DResource(Voxel3D* /*v*/) {}
-void GFX_UpdateVoxel3DResource(Voxel3D* /*v*/, const std::vector<VertexColor>& /*vertices*/, const std::vector<IndexType>& /*indices*/) {}
-void GFX_DrawVoxel3D(Voxel3D* /*v*/) {}
+// ----- Voxel3D / Terrain3D ------------------------------------------------
+// Same shape as TileMap2D: engine cooks (VertexColor, IndexType) per comp,
+// we MVP-transform and draw via the shared helper.
 
-void GFX_CreateTerrain3DResource(Terrain3D* /*t*/) {}
-void GFX_DestroyTerrain3DResource(Terrain3D* /*t*/) {}
-void GFX_UpdateTerrain3DResource(Terrain3D* /*t*/, const std::vector<VertexColor>& /*vertices*/, const std::vector<IndexType>& /*indices*/) {}
-void GFX_DrawTerrain3D(Terrain3D* /*t*/) {}
+void GFX_CreateVoxel3DResource(Voxel3D* v)
+{
+    if (v == nullptr) return;
+    sVoxels[v];
+}
+void GFX_DestroyVoxel3DResource(Voxel3D* v)
+{
+    if (v == nullptr) return;
+    sVoxels.erase(v);
+}
+void GFX_UpdateVoxel3DResource(Voxel3D* v,
+                                const std::vector<VertexColor>& vertices,
+                                const std::vector<IndexType>&   indices)
+{
+    if (v == nullptr) return;
+    auto& d = sVoxels[v];
+    d.mVerts   = vertices;
+    d.mIndices = indices;
+}
+void GFX_DrawVoxel3D(Voxel3D* v)
+{
+    if (v == nullptr) return;
+    auto it = sVoxels.find(v);
+    if (it == sVoxels.end()) return;
+    DrawVertexColorMesh(it->second, v->GetRenderTransform(),
+                        GetVcMeshTexture(v));
+}
 
-void GFX_CreateTileMap2DResource(TileMap2D* /*tm*/) {}
-void GFX_DestroyTileMap2DResource(TileMap2D* /*tm*/) {}
-void GFX_UpdateTileMap2DResource(TileMap2D* /*tm*/, const std::vector<VertexColor>& /*vertices*/, const std::vector<IndexType>& /*indices*/) {}
-void GFX_DrawTileMap2D(TileMap2D* /*tm*/) {}
+void GFX_CreateTerrain3DResource(Terrain3D* t)
+{
+    if (t == nullptr) return;
+    sTerrains[t];
+}
+void GFX_DestroyTerrain3DResource(Terrain3D* t)
+{
+    if (t == nullptr) return;
+    sTerrains.erase(t);
+}
+void GFX_UpdateTerrain3DResource(Terrain3D* t,
+                                  const std::vector<VertexColor>& vertices,
+                                  const std::vector<IndexType>&   indices)
+{
+    if (t == nullptr) return;
+    auto& d = sTerrains[t];
+    d.mVerts   = vertices;
+    d.mIndices = indices;
+}
+void GFX_DrawTerrain3D(Terrain3D* t)
+{
+    if (t == nullptr) return;
+    auto it = sTerrains.find(t);
+    if (it == sTerrains.end()) return;
+    DrawVertexColorMesh(it->second, t->GetRenderTransform(),
+                        GetVcMeshTexture(t));
+}
+
+// =========================================================================
+// TileMap2D — Phase 3
+// =========================================================================
+// Engine CPU-builds a triangle mesh from the tilemap's tile grid + tileset
+// atlas each time the tilemap changes, then hands us VertexColor + indices.
+// We stash per-comp and draw with the same MVP transform path as static
+// meshes — unlit (tilemaps are typically self-illuminated 2D art), no
+// backface cull (tiles can be viewed from either side at any angle).
+
+namespace
+{
+    // Storage for any "engine-built vertex+index mesh" node — TileMap2D,
+    // Terrain3D, Voxel3D. All three feed VertexColor + IndexType arrays
+    // and want the same unlit + alpha-blend draw treatment.
+    struct Ps2VertexColorMesh
+    {
+        std::vector<VertexColor> mVerts;
+        std::vector<IndexType>   mIndices;
+    };
+    std::unordered_map<TileMap2D*, Ps2VertexColorMesh> sTileMaps;
+    std::unordered_map<Terrain3D*, Ps2VertexColorMesh> sTerrains;
+    std::unordered_map<Voxel3D*,   Ps2VertexColorMesh> sVoxels;
+
+    // Shared draw helper. CPU MVP transform → perspective divide → viewport
+    // map → gsKit goraud_texture (textured) or gsKit_prim_triangle_gouraud
+    // (untextured) per triangle. No backface cull, no lighting modulation —
+    // VertexColor already has per-vertex color baked in (engine
+    // pre-shades). Alpha blend ON because tilemap/voxel layers often have
+    // transparent edges. Same Z mapping as static meshes so they Z-test
+    // correctly against lit 3D geometry.
+    void DrawVertexColorMesh(const Ps2VertexColorMesh& data,
+                              const glm::mat4& model,
+                              Ps2TextureData* texSlot)
+    {
+        if (sGsGlobal == nullptr || data.mIndices.empty()) return;
+
+        World* world = GetWorld(0);
+        if (world == nullptr) return;
+        Camera3D* camera = world->GetActiveCamera();
+        if (camera == nullptr) return;
+        const glm::mat4 mvp = camera->GetViewProjectionMatrix() * model;
+
+        sGsGlobal->PrimAlphaEnable = GS_SETTING_ON;
+        if (texSlot != nullptr)
+        {
+            gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
+            gsKit_set_clamp(sGsGlobal, texSlot->mClampMode);
+        }
+        const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
+        const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
+        const u64 kIdentity = GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0);
+
+        const uint32_t numTris = (uint32_t)data.mIndices.size() / 3;
+        for (uint32_t t = 0; t < numTris; ++t)
+        {
+            const uint32_t i0 = data.mIndices[t * 3 + 0];
+            const uint32_t i1 = data.mIndices[t * 3 + 1];
+            const uint32_t i2 = data.mIndices[t * 3 + 2];
+
+            const glm::vec4 p0 = mvp * glm::vec4(data.mVerts[i0].mPosition, 1.0f);
+            const glm::vec4 p1 = mvp * glm::vec4(data.mVerts[i1].mPosition, 1.0f);
+            const glm::vec4 p2 = mvp * glm::vec4(data.mVerts[i2].mPosition, 1.0f);
+            if (p0.w <= 0.0f || p1.w <= 0.0f || p2.w <= 0.0f) continue;
+
+            const float invW0 = 1.0f / p0.w, invW1 = 1.0f / p1.w, invW2 = 1.0f / p2.w;
+            const float nx0 = p0.x * invW0, ny0 = p0.y * invW0, nz0 = p0.z * invW0;
+            const float nx1 = p1.x * invW1, ny1 = p1.y * invW1, nz1 = p1.z * invW1;
+            const float nx2 = p2.x * invW2, ny2 = p2.y * invW2, nz2 = p2.z * invW2;
+
+            const float x0 = (nx0 * 0.5f + 0.5f) * kViewportW;
+            const float y0 = (1.0f - (ny0 * 0.5f + 0.5f)) * kViewportH;
+            const float x1 = (nx1 * 0.5f + 0.5f) * kViewportW;
+            const float y1 = (1.0f - (ny1 * 0.5f + 0.5f)) * kViewportH;
+            const float x2 = (nx2 * 0.5f + 0.5f) * kViewportW;
+            const float y2 = (1.0f - (ny2 * 0.5f + 0.5f)) * kViewportH;
+
+            const int iz0 = (int)((1.0f - nz0) * 16383.5f);
+            const int iz1 = (int)((1.0f - nz1) * 16383.5f);
+            const int iz2 = (int)((1.0f - nz2) * 16383.5f);
+
+            if (texSlot != nullptr)
+            {
+                const glm::vec2& uv0 = data.mVerts[i0].mTexcoord0;
+                const glm::vec2& uv1 = data.mVerts[i1].mTexcoord0;
+                const glm::vec2& uv2 = data.mVerts[i2].mTexcoord0;
+                gsKit_prim_triangle_goraud_texture_3d(sGsGlobal, &texSlot->mGsTex,
+                    x0, y0, iz0, uv0.x * texW, uv0.y * texH,
+                    x1, y1, iz1, uv1.x * texW, uv1.y * texH,
+                    x2, y2, iz2, uv2.x * texW, uv2.y * texH,
+                    kIdentity, kIdentity, kIdentity);
+            }
+            else
+            {
+                const int izAvg = (iz0 + iz1 + iz2) / 3;
+                gsKit_prim_triangle_gouraud(sGsGlobal,
+                    x0, y0, x1, y1, x2, y2, izAvg,
+                    kIdentity, kIdentity, kIdentity);
+            }
+        }
+    }
+
+    // Look up an engine-side texture slot by walking material → texture →
+    // sTextures map. Returns nullptr if any link is missing.
+    template <typename CompT>
+    Ps2TextureData* GetVcMeshTexture(CompT* comp)
+    {
+        Material* matBase = comp->GetMaterial();
+        MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+        if (mat == nullptr || mat->GetTexture(0) == nullptr) return nullptr;
+        auto it = sTextures.find(mat->GetTexture(0));
+        return (it != sTextures.end()) ? &it->second : nullptr;
+    }
+}
+
+void GFX_CreateTileMap2DResource(TileMap2D* tm)
+{
+    if (tm == nullptr) return;
+    sTileMaps[tm];   // ensure slot exists
+}
+
+void GFX_DestroyTileMap2DResource(TileMap2D* tm)
+{
+    if (tm == nullptr) return;
+    sTileMaps.erase(tm);
+}
+
+void GFX_UpdateTileMap2DResource(TileMap2D* tm,
+                                  const std::vector<VertexColor>& vertices,
+                                  const std::vector<IndexType>&   indices)
+{
+    if (tm == nullptr) return;
+    auto& d = sTileMaps[tm];
+    d.mVerts   = vertices;
+    d.mIndices = indices;
+}
+
+void GFX_DrawTileMap2D(TileMap2D* tm)
+{
+    if (tm == nullptr) return;
+    auto it = sTileMaps.find(tm);
+    if (it == sTileMaps.end()) return;
+    DrawVertexColorMesh(it->second, tm->GetRenderTransform(),
+                        GetVcMeshTexture(tm));
+}
 
 // ----- Particles ----------------------------------------------------------
 // =========================================================================
