@@ -23,10 +23,21 @@
 #include <sifrpc.h>
 #include <loadfile.h>
 #include <iopcontrol.h>
+#include <iopheap.h>        // SifInitIopHeap — required before SifLoadModuleBuffer
 #include <sbv_patches.h>
 #include <debug.h>           // init_scr / scr_printf — boot-phase tty
+#include <audsrv.h>          // EE-side stubs for the audsrv IOP module
 #include <stdio.h>
 #include <string.h>
+
+// Embedded audsrv.irx — generated at build time by `$(PS2SDK)/bin/bin2c`
+// (see Makefile_PS2). bin2c emits a C source file declaring
+//   unsigned char audsrv_irx[]      = { 0x7f, 0x45, 0x4c, 0x46, ... };
+//   unsigned int  size_audsrv_irx   = sizeof(audsrv_irx);
+// We pass the buffer to SifExecModuleBuffer so the IOP loads audsrv from
+// EE RAM (works under PCSX2 -elf and from disc/MC alike).
+extern "C" unsigned char audsrv_irx[];
+extern "C" unsigned int  size_audsrv_irx;
 
 #include "Engine.h"
 #include "EmbeddedFile.h"
@@ -115,11 +126,72 @@ int main(int argc, char** argv)
     sbv_patch_enable_lmb();
     sbv_patch_disable_prefix_check();
 
+    // SifLoadFileInit opens the LoadFile RPC channel on the IOP — required
+    // before any SifLoadModule / SifLoadModuleBuffer call. SifInitIopHeap
+    // sets up the IOP-side allocator (audsrv allocates internal buffers
+    // for its mixer on the IOP at init time). Order matters: LoadFileInit
+    // first (RPC channel up), then IopHeap.
+    SifLoadFileInit();
+    SifInitIopHeap();
+
     // Boot-phase tty so we can see something before gsKit takes over.
     init_scr();
 
     Ps2_BootLog("[1] main() entered");
     Ps2_BootLog("[2] SIF + sbv patches applied");
+
+    // ---- Load audio IRX stack --------------------------------------------
+    // audsrv (the EE-side libaudsrv) RPCs into the audsrv IRX running on
+    // the IOP, which drives the SPU2 via the LIBSD IRX. Load order is
+    // mandatory: LIBSD first (from rom0:, present on every PS2 + PCSX2),
+    // then audsrv from our embedded buffer, then audsrv_init(). Any
+    // failure → audio offline but engine continues silently.
+    {
+        const int libsdRet = SifLoadModule("rom0:LIBSD", 0, nullptr);
+        if (libsdRet < 0)
+        {
+            scr_printf("[2a] LIBSD load failed: %d — audio offline\n", libsdRet);
+        }
+        else
+        {
+            // SifExecModuleBuffer takes EXPLICIT size + returns IOP init
+            // result separately from the load result. This is what
+            // ps2sdk-ports/SDL uses to embed audsrv via bin2c (the
+            // canonical pattern — most reliable across PCSX2 versions
+            // and real hardware).
+            int audsrvInit = 0;
+            const int audsrvRet = SifExecModuleBuffer(
+                audsrv_irx,
+                size_audsrv_irx,
+                /*arg_len=*/0,
+                /*args=*/nullptr,
+                &audsrvInit);
+            if (audsrvRet < 0)
+            {
+                scr_printf("[2a] audsrv exec failed: ret=%d init=%d size=%u — audio offline\n",
+                           audsrvRet, audsrvInit, (unsigned)size_audsrv_irx);
+            }
+            else if (audsrvInit < 0)
+            {
+                scr_printf("[2a] audsrv module-init failed: %d (loaded ok, ret=%d) — audio offline\n",
+                           audsrvInit, audsrvRet);
+            }
+            else
+            {
+                const int initRet = audsrv_init();
+                if (initRet != 0)
+                {
+                    scr_printf("[2a] audsrv_init failed: %d — %s\n",
+                               initRet, audsrv_get_error_string());
+                }
+                else
+                {
+                    scr_printf("[2a] audsrv up (libsd=%d audsrv=%d init=%d size=%u)\n",
+                               libsdRet, audsrvRet, audsrvInit, (unsigned)size_audsrv_irx);
+                }
+            }
+        }
+    }
 
     Ps2_BootLog("[3] About to call GameMain()");
     GameMain(argc, argv);

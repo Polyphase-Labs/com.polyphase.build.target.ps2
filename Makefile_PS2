@@ -198,6 +198,45 @@ CPPFILES += $(ADDON_CPPFILES_EXTRA)
 VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
 EE_OBJS := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 
+# ---- audsrv.irx embedding ---------------------------------------------------
+# audsrv runs on the IOP and is the standard PS2 software audio mixer. We
+# embed audsrv.irx into the ELF so SifLoadModuleBuffer can hand it to the
+# IOP from EE RAM (works under PCSX2 -elf and from disc alike — no separate
+# IRX file alongside the ELF needed).
+#
+# Mechanism: objcopy --input binary converts the raw IRX bytes directly to
+# an EE-elf .o file. The resulting object has three auto-generated symbols
+# matching `_binary_<basename>_start/_end/_size`. Renaming the section
+# from .data to .rodata reduces RAM footprint (the bytes go into the ROM
+# image / read-only segment instead of being copied at runtime).
+#
+# Why not `.incbin`: it works in theory but the path quoting through
+# successive make/shell layers was producing a truncated IRX (-201 from
+# the IOP loader = bad header), and objcopy sidesteps the entire mess.
+# Why not bin2s: PS2SDK doesn't ship it.
+AUDSRV_IRX_SRC := $(PS2SDK)/iop/irx/audsrv.irx
+# Depend on the Makefile itself so any change to the recipe forces a
+# rebuild of the .o — GNU make only watches file deps by default, not
+# recipe changes.
+#
+# Mechanism: `$(PS2SDK)/bin/bin2c` generates a C source file declaring
+#   unsigned char audsrv_irx[] = { 0x7f, 0x45, 0x4c, 0x46, ... };
+#   unsigned int  size_audsrv_irx = sizeof(audsrv_irx);
+# This is the canonical PS2SDK pattern — matches what ps2sdk-ports/SDL
+# and most homebrew use to embed IRX modules. The compiler handles
+# alignment + section placement (.rodata by default with -O2), and the
+# resulting .o has no ABI ambiguity since it's just a regular C object.
+#
+# `ld -r -b binary` produced bytes that the IOP loader rejected with -201
+# (KE_LINKERR) — likely missing alignment, missing const-ness, or a
+# section attribute mismatch. bin2c sidesteps the whole class of issues.
+audsrv_irx.c: $(AUDSRV_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ audsrv_irx
+audsrv_irx.o: audsrv_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += audsrv_irx.o
+
 # ---- Flags ------------------------------------------------------------------
 # Variant 2 platform-extension flag plus PS2-native macros. Makefile.eeglobal_cpp
 # will prepend -D_EE -G0 -O2 etc. — do NOT add -G0 ourselves; overriding breaks
@@ -243,9 +282,12 @@ EE_LIBDIR = -L$(PS2SDK)/ports/lib -L$(PS2SDK)/ee/lib -L$(PS2DEV)/gsKit/lib $(add
 EE_LDFLAGS = $(EE_LIBDIR) -Wl,--allow-multiple-definition
 EE_LIBS = \
     -lgskit_toolkit -lgskit -ldmakit \
+    -laudsrv \
     -lfileXio -lpatches -ldebug \
     -lm -lc -lkernel -latomic \
     $(addprefix -l,$(ADDON_LIBS))
+# -laudsrv: EE-side stubs that RPC into the audsrv IRX (loaded by
+# Main_PS2.cpp via SifLoadModuleBuffer from the embedded blob).
 # -latomic: engine's std::atomic<uint64_t>/atomic<bool> calls need libatomic
 # for sub-word RMW intrinsics (__atomic_fetch_add_4, __atomic_exchange_1) that
 # the EE GCC backend doesn't lower to native MIPS atomic instructions.

@@ -582,6 +582,18 @@ namespace
         const std::string region   = ReadOption(ctx, kRegionKey, kRegionDefault);
         const std::string makeIso  = ReadOption(ctx, kMakeIsoKey, kMakeIsoDefault);
 
+        // Diagnostic: print every option PostPackage saw, especially
+        // makeIso. If makeIso != "1" here even though the user checked
+        // the box, the build profile didn't persist the change.
+        if (ctx->WriteOutputLine)
+        {
+            char dbg[256];
+            std::snprintf(dbg, sizeof(dbg),
+                "[PS2 PostPackage] title='%s' discId='%s' region='%s' makeIso='%s'",
+                title.c_str(), discId.c_str(), region.c_str(), makeIso.c_str());
+            ctx->WriteOutputLine(dbg);
+        }
+
         const std::string outDir   = ctx->packageOutputDir;
         const std::string elfPath  = outDir + "/" + ctx->projectName + ".elf";
         const std::string discElf  = outDir + "/" + discId + ".ELF";

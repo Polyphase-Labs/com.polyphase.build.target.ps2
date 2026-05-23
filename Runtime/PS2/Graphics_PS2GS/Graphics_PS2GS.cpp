@@ -1263,9 +1263,47 @@ namespace
             0);
     }
 
+    // Per-widget rotation around a screen-space pivot. Returns (sin, cos)
+    // for the rotation matrix. Caller computes:
+    //   p' = pivot + Rot(p - pivot)
+    // (post-posScale/posOffset, so rotation is in final screen space).
+    struct UIRotation
+    {
+        glm::vec2 mPivot  = glm::vec2(0.0f);
+        float     mSin    = 0.0f;
+        float     mCos    = 1.0f;
+        bool      mActive = false;
+    };
+
+    UIRotation MakeUIRotation(Widget* w)
+    {
+        UIRotation out;
+        if (w == nullptr) return out;
+        const float degrees = w->GetRotation();
+        if (degrees == 0.0f) return out;   // fast path — most widgets don't rotate
+        const float rad = degrees * (3.14159265358979323846f / 180.0f);
+        const Rect r = w->GetRect();
+        const glm::vec2 pn = w->GetPivot();
+        out.mPivot  = glm::vec2(r.mX + r.mWidth * pn.x, r.mY + r.mHeight * pn.y);
+        out.mSin    = sinf(rad);
+        out.mCos    = cosf(rad);
+        out.mActive = true;
+        return out;
+    }
+
+    inline void ApplyRotation(float& x, float& y, const UIRotation& rot)
+    {
+        if (!rot.mActive) return;
+        const float dx = x - rot.mPivot.x;
+        const float dy = y - rot.mPivot.y;
+        x = rot.mPivot.x + dx * rot.mCos - dy * rot.mSin;
+        y = rot.mPivot.y + dx * rot.mSin + dy * rot.mCos;
+    }
+
     void SubmitUITriList(const VertexUI* verts, uint32_t numVerts,
                          const glm::vec4& tint, Ps2TextureData* texSlot,
-                         const glm::vec2& posScale, const glm::vec2& posOffset)
+                         const glm::vec2& posScale, const glm::vec2& posOffset,
+                         const UIRotation& rot)
     {
         if (verts == nullptr || numVerts < 3) return;
 
@@ -1290,12 +1328,16 @@ namespace
             const VertexUI& v1 = verts[t * 3 + 1];
             const VertexUI& v2 = verts[t * 3 + 2];
 
-            const float x0 = v0.mPosition.x * posScale.x + posOffset.x;
-            const float y0 = v0.mPosition.y * posScale.y + posOffset.y;
-            const float x1 = v1.mPosition.x * posScale.x + posOffset.x;
-            const float y1 = v1.mPosition.y * posScale.y + posOffset.y;
-            const float x2 = v2.mPosition.x * posScale.x + posOffset.x;
-            const float y2 = v2.mPosition.y * posScale.y + posOffset.y;
+            float x0 = v0.mPosition.x * posScale.x + posOffset.x;
+            float y0 = v0.mPosition.y * posScale.y + posOffset.y;
+            float x1 = v1.mPosition.x * posScale.x + posOffset.x;
+            float y1 = v1.mPosition.y * posScale.y + posOffset.y;
+            float x2 = v2.mPosition.x * posScale.x + posOffset.x;
+            float y2 = v2.mPosition.y * posScale.y + posOffset.y;
+            // Widget rotation around screen-space pivot (no-op when angle=0).
+            ApplyRotation(x0, y0, rot);
+            ApplyRotation(x1, y1, rot);
+            ApplyRotation(x2, y2, rot);
 
             const u64 c0 = UnpackVertexColor(v0.mColor, tint);
             const u64 c1 = UnpackVertexColor(v1.mColor, tint);
@@ -1323,7 +1365,8 @@ namespace
     // single-threaded and one draw at a time, so reuse is fine.
     void SubmitUITriFan(const VertexUI* verts, uint32_t numVerts,
                        const glm::vec4& tint, Ps2TextureData* texSlot,
-                       const glm::vec2& posScale, const glm::vec2& posOffset)
+                       const glm::vec2& posScale, const glm::vec2& posOffset,
+                       const UIRotation& rot)
     {
         if (verts == nullptr || numVerts < 3) return;
         constexpr uint32_t kMaxFanVerts = 256;
@@ -1338,7 +1381,7 @@ namespace
             sFanBuf[w++] = verts[t + 1];
             sFanBuf[w++] = verts[t + 2];
         }
-        SubmitUITriList(sFanBuf, numTris * 3, tint, texSlot, posScale, posOffset);
+        SubmitUITriList(sFanBuf, numTris * 3, tint, texSlot, posScale, posOffset, rot);
     }
 
     Ps2TextureData* GetUITexture(Texture* tex)
@@ -1366,7 +1409,8 @@ void GFX_DrawQuad(Quad* quad)
     const uint32_t n = quad->GetNumVertices();
     if (verts == nullptr || n < 3) return;
     SubmitUITriFan(verts, n, quad->GetColor(), GetUITexture(quad->GetTexture()),
-                   glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f));
+                   glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f),
+                   MakeUIRotation(quad));
 }
 
 // ---- QuadBorder ---------------------------------------------------------
@@ -1412,7 +1456,7 @@ void GFX_DrawText(Text* text)
     const glm::vec2 posOffset(rect.mX + justified.x, rect.mY + justified.y);
 
     SubmitUITriList(verts, numVerts, text->GetColor(), GetUITexture(fontTex),
-                    posScale, posOffset);
+                    posScale, posOffset, MakeUIRotation(text));
 }
 
 // ---- Poly ---------------------------------------------------------------
@@ -1428,7 +1472,8 @@ void GFX_DrawPoly(Poly* poly)
     const uint32_t n = poly->GetNumVertices();
     if (verts == nullptr || n < 3) return;
     SubmitUITriFan(verts, n, poly->GetColor(), GetUITexture(poly->GetTexture()),
-                   glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f));
+                   glm::vec2(1.0f, 1.0f), glm::vec2(0.0f, 0.0f),
+                   MakeUIRotation(poly));
 }
 
 // ----- Direct static mesh draw + post-process ----------------------------
