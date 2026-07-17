@@ -41,6 +41,7 @@
 #include "Engine/Nodes/3D/InstancedMesh3d.h"
 #include "Engine/Nodes/3D/Particle3d.h"
 #include "Engine/Nodes/3D/DirectionalLight3d.h"
+#include "Engine/Nodes/3D/PointLight3d.h"
 #include "Engine/Nodes/Widgets/Quad.h"
 #include "Engine/Nodes/Widgets/Text.h"
 #include "Engine/Nodes/Widgets/Poly.h"
@@ -691,9 +692,8 @@ namespace
 }
 
 // ----- Lighting (CPU per-vertex Lambert) ----------------------------------
-// PS2 GS has no built-in lighting. We bake one directional light's
-// contribution into per-vertex modulation color CPU-side. Walks the world
-// for the first DirectionalLight3D; if none, falls back to ambient white.
+// PS2 GS has no built-in lighting. We bake ambient + one directional light +
+// up to kMaxPointLights point lights into per-vertex modulation color CPU-side.
 // Engine vertex normals are in model space; we transform by model[0..2][0..2]
 // (no inverse-transpose — non-uniform scale will skew, acceptable for v1).
 namespace
@@ -1166,12 +1166,15 @@ namespace
             // momentarily disappear when they're edge-on. Cull anything
             // within ±0.5 px² of zero; visually those triangles cover less
             // than a pixel anyway.
-            // Two-sided materials (CullMode::None) skip the test entirely; Front
-            // culling inverts it. invertCull (skybox) also inverts. XOR combines
-            // the two inversions.
-            if (cull != CullMode::None)
+            // Two-sided materials (CullMode::None) skip the test entirely.
+            // Skybox: invertCull already selects the inward-facing winding — and the
+            // engine ALSO tags the sky material CullMode::Front for the same effect
+            // on desktop (Mesh3d.cpp), so on PS2 we must NOT apply both or they
+            // cancel and the sky culls to nothing (black). invertCull wins for the
+            // sky; otherwise honor the material cull mode (Front inverts back-cull).
+            if (cull != CullMode::None || invertCull)
             {
-                const bool invert = invertCull ^ (cull == CullMode::Front);
+                const bool invert = invertCull ? true : (cull == CullMode::Front);
                 const float signedArea = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
                 constexpr float kCullEpsilon = 0.5f;
                 if (invert
@@ -1533,10 +1536,11 @@ void GFX_DrawTextMeshComp(TextMesh3D* c)
         if (texIt != sTextures.end()) texSlot = &texIt->second;
     }
 
-    PointLightish light = GatherMainLight(world);
+    SceneLighting light = GatherLighting(world);
+    const bool unlit = (mat != nullptr && mat->GetShadingModel() == ShadingModel::Unlit);
     DrawTrisHelper(it->second.mVerts, it->second.mIndices,
                    model, mvp, texSlot, light,
-                   /*unlit=*/false, /*invertCull=*/false);
+                   unlit, /*invertCull=*/false, mat);
 }
 
 // ----- Voxel / Terrain / TileMap -----------------------------------------
