@@ -60,6 +60,7 @@ namespace
 {
     constexpr int kOutputRate         = 44100;
     constexpr int kFramesPerBuffer    = 1024;          // ~23 ms @ 44.1 kHz
+    constexpr int kMaxFillPerWait     = 128;           // cap buffers queued per wait (~3s)
     constexpr int kSamplesPerBuffer   = kFramesPerBuffer * 2;  // stereo
     constexpr int kBytesPerBuffer     = kSamplesPerBuffer * 2; // S16
     // Per-voice base attenuation — mirrors PSP's 0.5 (6 dB headroom).
@@ -82,13 +83,17 @@ namespace
         uint8_t         numChannels   = 1;
         uint8_t         bitsPerSample = 16;
         bool            loop          = false;
-        // positionFrac is mixer-thread-private — engine threads only set it
-        // to 0.0 inside AUD_Play under the lock. No need for volatile, and
-        // marking volatile forces every += through memory which on PS2's
-        // non-IEC559 FPU was producing wonky comparisons (voice never
-        // reaching numFrames cleanly → one-shot sounds looping forever).
-        double          positionFrac  = 0.0;
-        double          rate          = 1.0;
+        // Integer fixed-point playback cursor (16.16). The EE FPU is single-
+        // precision only, so per-frame `double` resample math traps into a
+        // ~million-cycle soft-float/exception path — for a continuous (long or
+        // looping) sound that runs the mix loop every buffer, that alone drops
+        // the mixer from 43 buffers/s to ~1, i.e. choppy slow-motion audio.
+        // Integer math keeps the loop in native ops AND makes the loop-wrap
+        // comparison exact (the old double compare occasionally never reached
+        // numFrames cleanly → one-shots looped forever).
+        uint32_t        posFrames     = 0;      // integer source-frame index
+        uint32_t        posFrac       = 0;      // fractional part, 16.16
+        uint32_t        rateFixed     = 0x10000;// source frames per output frame, 16.16
         int32_t         leftVolQ15    = 32768;
         int32_t         rightVolQ15   = 32768;
     };
@@ -107,8 +112,14 @@ namespace
         int16_t*        ring          = nullptr;
         uint32_t        ringFrames    = 0;
         uint64_t        writeFrameAbs = 0;
-        double          readFrameAbs  = 0.0;
-        double          rate          = 1.0;
+        // Integer fixed-point read cursor. The EE FPU is single-precision only, so
+        // per-frame `double` resample math traps into slow soft-float — deadly in a
+        // 1024-iter loop that runs every buffer for a continuous stream. All-integer
+        // 16.16 fixed-point keeps the mix loop in native hardware ops.
+        uint64_t        readFrameInt  = 0;      // absolute source frame (integer part)
+        uint32_t        readFrac      = 0;      // fractional part, 16.16
+        uint32_t        rateFixed     = 0x10000;// source frames per output frame, 16.16
+        uint32_t        ringIdx       = 0;      // readFrameInt % ringFrames, kept incrementally
         int32_t         leftVolQ15    = 32768;
         int32_t         rightVolQ15   = 32768;
     };
@@ -162,10 +173,9 @@ namespace
         }
     }
 
-    inline void FetchStreamFrame(const Ps2Stream& s, uint64_t srcFrameAbs,
+    inline void FetchStreamFrame(const Ps2Stream& s, uint32_t ringIdx,
                                  int32_t& outL, int32_t& outR)
     {
-        const uint32_t ringIdx = (uint32_t)(srcFrameAbs % s.ringFrames);
         if (s.numChannels == 2)
         {
             outL = s.ring[ringIdx * 2 + 0];
@@ -191,14 +201,11 @@ namespace
 
             for (int f = 0; f < kFramesPerBuffer; ++f)
             {
-                uint32_t srcFrame = (uint32_t)v.positionFrac;
-                if (srcFrame >= v.numFrames)
+                if (v.posFrames >= v.numFrames)
                 {
                     if (v.loop)
                     {
-                        v.positionFrac -= (double)v.numFrames;
-                        srcFrame = (uint32_t)v.positionFrac;
-                        if (srcFrame >= v.numFrames) srcFrame = 0;
+                        while (v.posFrames >= v.numFrames) v.posFrames -= v.numFrames;
                     }
                     else
                     {
@@ -207,10 +214,14 @@ namespace
                     }
                 }
                 int32_t srcL, srcR;
-                FetchFrame(v, srcFrame, srcL, srcR);
+                FetchFrame(v, v.posFrames, srcL, srcR);
                 sMixBuffer[f * 2 + 0] += (srcL * v.leftVolQ15)  >> 15;
                 sMixBuffer[f * 2 + 1] += (srcR * v.rightVolQ15) >> 15;
-                v.positionFrac += v.rate;
+
+                // Advance the fixed-point cursor by rate (16.16) — integer only.
+                v.posFrac += v.rateFixed;
+                v.posFrames += (v.posFrac >> 16);
+                v.posFrac  &= 0xFFFFu;
             }
         }
 
@@ -221,13 +232,23 @@ namespace
 
             for (int f = 0; f < kFramesPerBuffer; ++f)
             {
-                const uint64_t srcAbs = (uint64_t)s.readFrameAbs;
-                if (srcAbs >= s.writeFrameAbs) break;   // under-run, output silence
+                if (s.readFrameInt >= s.writeFrameAbs) break;   // under-run, output silence
                 int32_t srcL, srcR;
-                FetchStreamFrame(s, srcAbs, srcL, srcR);
+                FetchStreamFrame(s, s.ringIdx, srcL, srcR);
                 sMixBuffer[f * 2 + 0] += (srcL * s.leftVolQ15)  >> 15;
                 sMixBuffer[f * 2 + 1] += (srcR * s.rightVolQ15) >> 15;
-                s.readFrameAbs += s.rate;
+
+                // Advance the fixed-point cursor by rate (16.16). `whole` is the number
+                // of whole source frames to step (0 or 1 at 22→44k; more when upsampling).
+                s.readFrac += s.rateFixed;
+                uint32_t whole = s.readFrac >> 16;
+                if (whole)
+                {
+                    s.readFrac &= 0xFFFFu;
+                    s.readFrameInt += whole;
+                    s.ringIdx      += whole;
+                    while (s.ringIdx >= s.ringFrames) s.ringIdx -= s.ringFrames;
+                }
             }
         }
 
@@ -279,9 +300,26 @@ namespace
         // close as possible to the playhead (lower added latency).
         while (sMixerRun)
         {
-            audsrv_wait_audio(kBytesPerBuffer);
-            MixOneBuffer();
-            audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
+            // Poll the ring's free space directly (audsrv_available) instead of
+            // blocking in audsrv_wait_audio. On PCSX2 wait_audio's IOP-side
+            // "room available" signal only fires ~once/second, so it delivered
+            // ~1 buffer/s → SPU2 drained its ring, STOPPED (no auto-restart), and
+            // audio crawled. audsrv_available() reads the ring heads live, so we
+            // top the ring up at the true SPU2 drain rate and it never underruns.
+            int avail  = audsrv_available();
+            int filled = 0;
+            while (avail >= kBytesPerBuffer && filled < kMaxFillPerWait)
+            {
+                MixOneBuffer();
+                audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
+                avail -= kBytesPerBuffer;
+                ++filled;
+            }
+
+            // Short sleep so we don't busy-poll the IOP. Much shorter than the
+            // ring's play-out time, so the ring we just topped can't drain to
+            // empty before the next refill (that would restart the SPU2-stall).
+            usleep(2000);   // 2 ms
         }
         // Drain with one silent buffer so SPU2 doesn't loop its last block
         // audibly on shutdown.
@@ -324,11 +362,6 @@ void AUD_Initialize()
     LogDebug("Audio_PS2: audsrv_set_volume(%d) = %d (%s)",
              MAX_VOLUME, setVolRet,
              setVolRet == 0 ? "ok" : audsrv_get_error_string());
-
-    // Startup test tone removed — proved the chain works, now it's just
-    // interfering with the real mixer's wait_audio (audsrv apparently
-    // doesn't auto-restart SPU2 after the ring drains, leaving wait_audio
-    // blocked forever once the tone finishes).
 
     ee_sema_t sema = {};
     sema.init_count = 1;
@@ -425,7 +458,11 @@ void AUD_Shutdown()
     }
 }
 
-void AUD_Update() {}
+void AUD_Update()
+{
+    // Nothing to do on the main thread — the software mixer runs on its own
+    // thread (sMixerThread) and feeds audsrv continuously.
+}
 
 void AUD_Play(uint32_t voiceIndex, SoundWave* soundWave, float volume,
               float pitch, bool loop, float /*startTime*/, bool /*spatial*/)
@@ -436,17 +473,6 @@ void AUD_Play(uint32_t voiceIndex, SoundWave* soundWave, float volume,
     const uint32_t numFrames = soundWave->GetNumSamples();
     if (pcm == nullptr || numFrames == 0) return;
 
-    // Log Play calls so we can verify the engine passes loop=false for SFX.
-    // Capped to first 30 to avoid log spam on busy SFX scenes.
-    static int sPlayLog = 0;
-    if (sPlayLog < 30)
-    {
-        LogDebug("[PS2 AUD] AUD_Play v=%u name='%s' frames=%u rate=%u pitch=%.2f loop=%d vol=%.2f",
-                 voiceIndex, soundWave->GetName().c_str(), numFrames,
-                 soundWave->GetSampleRate(), pitch, (int)loop, volume);
-        ++sPlayLog;
-    }
-
     WaitSema(sVoiceLock);
     Ps2Voice& v       = sVoices[voiceIndex];
     v.pcmData         = pcm;
@@ -455,15 +481,18 @@ void AUD_Play(uint32_t voiceIndex, SoundWave* soundWave, float volume,
     v.numChannels     = (uint8_t)soundWave->GetNumChannels();
     v.bitsPerSample   = (uint8_t)soundWave->GetBitsPerSample();
     v.loop            = loop;
-    v.positionFrac    = 0.0;
+    v.posFrames       = 0;
+    v.posFrac         = 0;
     // Clamp pitch to a sane range so a runaway value (NaN, negative,
     // very large) can't either freeze the voice (rate=0) or read garbage
     // past the buffer end at hyper-fast playback (rate >> 1).
     float safePitch = pitch;
     if (!(safePitch > 0.01f) || safePitch > 8.0f) safePitch = 1.0f;
-    v.rate            = (v.sampleRate > 0)
-                          ? ((double)v.sampleRate * (double)safePitch / (double)kOutputRate)
-                          : 1.0;
+    // rate in 16.16 fixed-point. Computed once here (not per mix-frame), so the
+    // one float divide is fine; the per-frame mix loop stays all-integer.
+    v.rateFixed       = (v.sampleRate > 0)
+                          ? (uint32_t)(((double)v.sampleRate * (double)safePitch * 65536.0) / (double)kOutputRate)
+                          : 0x10000u;
     const int32_t vq15 = ClampVolQ15(volume);
     v.leftVolQ15      = vq15;
     v.rightVolQ15     = vq15;
@@ -499,20 +528,23 @@ void AUD_SetPitch(uint32_t voiceIndex, float pitch)
     if (voiceIndex >= AUDIO_MAX_VOICES || sVoiceLock < 0) return;
     WaitSema(sVoiceLock);
     Ps2Voice& v = sVoices[voiceIndex];
-    v.rate = (v.sampleRate > 0)
-               ? ((double)v.sampleRate * (double)pitch / (double)kOutputRate)
-               : 1.0;
+    float safePitch = pitch;
+    if (!(safePitch > 0.01f) || safePitch > 8.0f) safePitch = 1.0f;
+    v.rateFixed = (v.sampleRate > 0)
+               ? (uint32_t)(((double)v.sampleRate * (double)safePitch * 65536.0) / (double)kOutputRate)
+               : 0x10000u;
     SignalSema(sVoiceLock);
 }
 
-uint8_t* AUD_AllocWaveBuffer(uint32_t size) { return (uint8_t*)malloc(size); }
+uint8_t* AUD_AllocWaveBuffer(uint32_t size)
+{
+    return (uint8_t*)malloc(size);
+}
 void AUD_FreeWaveBuffer(void* buffer) { free(buffer); }
 void AUD_ProcessWaveBuffer(SoundWave* /*soundWave*/) {}
 
 uint32_t AUD_OpenStream(uint32_t sampleRate, uint32_t numChannels, uint32_t bitsPerSample)
 {
-    LogDebug("[PS2 AUD] AUD_OpenStream rate=%u ch=%u bps=%u",
-             sampleRate, numChannels, bitsPerSample);
     if (sVoiceLock < 0) return 0;
     if (numChannels != 1 && numChannels != 2)
     {
@@ -554,8 +586,12 @@ uint32_t AUD_OpenStream(uint32_t sampleRate, uint32_t numChannels, uint32_t bits
     s.numChannels   = (uint8_t)numChannels;
     s.bitsPerSample = (uint8_t)bitsPerSample;
     s.writeFrameAbs = 0;
-    s.readFrameAbs  = 0.0;
-    s.rate          = (double)sampleRate / (double)kOutputRate;
+    s.readFrameInt  = 0;
+    s.readFrac      = 0;
+    // rate (src frames per output frame) in 16.16 fixed-point. Integer math only —
+    // the one double here runs once at open, not in the per-frame mix loop.
+    s.rateFixed     = (uint32_t)(((uint64_t)sampleRate << 16) / (uint64_t)kOutputRate);
+    s.ringIdx       = 0;
     s.leftVolQ15    = ClampVolQ15(1.0f);
     s.rightVolQ15   = ClampVolQ15(1.0f);
     s.paused        = false;
@@ -575,7 +611,9 @@ void AUD_CloseStream(uint32_t streamId)
         if (s.ring != nullptr) { free(s.ring); s.ring = nullptr; }
         s.ringFrames    = 0;
         s.writeFrameAbs = 0;
-        s.readFrameAbs  = 0.0;
+        s.readFrameInt  = 0;
+        s.readFrac      = 0;
+        s.ringIdx       = 0;
         s.inUse         = false;
         s.paused        = false;
     }
@@ -600,7 +638,7 @@ int32_t AUD_SubmitStreamBuffer(uint32_t streamId, const uint8_t* data, uint32_t 
     if (submitFrames == 0) { SignalSema(sVoiceLock); return 0; }
     if (submitFrames > s.ringFrames) submitFrames = s.ringFrames;
 
-    const uint64_t readAbsU64 = (uint64_t)s.readFrameAbs;
+    const uint64_t readAbsU64 = s.readFrameInt;
     const uint64_t inFlight   = s.writeFrameAbs - readAbsU64;
     const uint32_t freeFrames = (inFlight < s.ringFrames)
                                   ? (uint32_t)(s.ringFrames - inFlight)
@@ -639,13 +677,12 @@ int32_t AUD_SubmitStreamBuffer(uint32_t streamId, const uint8_t* data, uint32_t 
 uint64_t AUD_GetStreamPlayedSamples(uint32_t streamId)
 {
     if (streamId == 0 || streamId > kMaxStreams) return 0;
-    // Read without locking — readFrameAbs is a double (8 bytes); on the
-    // 32-bit-load R5900 EE the load isn't atomic, but A/V sync consumers
-    // tolerate a few-µs-stale value better than the contention this would
-    // add to the mixer's per-frame loop. If sync glitches surface here,
-    // switch to a 64-bit uint counter updated separately under the lock.
+    // Read without locking — readFrameInt is a 64-bit counter; on the 32-bit-load
+    // R5900 EE a 64-bit load isn't atomic, but A/V sync consumers tolerate a
+    // few-µs-stale value better than the lock contention it would add to the
+    // mixer's per-frame loop.
     const Ps2Stream& s = sStreams[streamId - 1];
-    return s.inUse ? (uint64_t)s.readFrameAbs : 0;
+    return s.inUse ? s.readFrameInt : 0;
 }
 
 void AUD_SetStreamVolume(uint32_t streamId, float volume)
@@ -676,7 +713,7 @@ void AUD_FlushStream(uint32_t streamId)
     Ps2Stream& s = sStreams[streamId - 1];
     if (s.inUse)
     {
-        s.writeFrameAbs = (uint64_t)s.readFrameAbs;
+        s.writeFrameAbs = s.readFrameInt;
     }
     SignalSema(sVoiceLock);
 }

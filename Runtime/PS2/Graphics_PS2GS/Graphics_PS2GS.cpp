@@ -53,10 +53,12 @@
 #include "Log.h"
 
 #include <gsKit.h>
+#include <gsInline.h>   // gsKit_heap_alloc, gsKit_float_to_int_* (not pulled by gsKit.h)
 #include <dmaKit.h>
 #include <gsToolkit.h>
 #include <kernel.h>
 #include <malloc.h>     // memalign (newlib's PS2 port)
+#include <math.h>       // expf — exponential fog ramp
 
 #include <unordered_map>
 
@@ -66,6 +68,46 @@
 namespace
 {
     GSGLOBAL* sGsGlobal = nullptr;
+
+    // Scene fog, stashed by GFX_SetFog (called every frame from Renderer::BeginFrame)
+    // and consumed as per-vertex GS hardware fog in the mesh draw helpers.
+    FogSettings sFog;
+
+    // ---- Vblank yield ------------------------------------------------------
+    // gsKit_sync_flip busy-waits (gsKit_vsync_wait spins on the GS field bit)
+    // for the rest of every frame — ~15 ms of EE spin at 60 Hz. On PCSX2 that
+    // spinning EE starves the emulated IOP, so audsrv can't push audio to SPU2
+    // fast enough and sound plays in ~15x slow-motion (the audsrv chain itself
+    // is fine — proven by the startup drain self-test). Sleeping the EE on a
+    // vblank-interrupt semaphore instead of spinning lets PCSX2 schedule the
+    // IOP, so SPU2 drains at full rate. GFX_EndFrame WaitSema()s this, then
+    // does gsKit's flip with FirstFrame forced so it skips its own busy-wait.
+    int sVblankSema = -1;
+
+    int VblankHandler(int /*cause*/)
+    {
+        if (sVblankSema >= 0) iSignalSema(sVblankSema);
+        return 0;
+    }
+
+    void InstallVblankYield()
+    {
+        if (sVblankSema >= 0) return;   // install once
+        ee_sema_t s = {};
+        s.init_count = 0;
+        s.max_count  = 1;
+        s.option     = 0;
+        sVblankSema = CreateSema(&s);
+        if (sVblankSema < 0)
+        {
+            LogWarning("[PS2] vblank sema create failed (%d) — audio may stay choppy", sVblankSema);
+            return;
+        }
+        AddIntcHandler(INTC_VBLANK_S, VblankHandler, 0);
+        EnableIntc(INTC_VBLANK_S);
+        LogDebug("[PS2] vblank-yield installed (sema=%d) — EE sleeps for vsync instead of spinning",
+                 sVblankSema);
+    }
 
     // Phase 0-2 hardcodes NTSC. Phase 3 will switch on EngineConfig region
     // (or a -DPS2_REGION_PAL macro) and pick GS_MODE_PAL / 640x512 instead.
@@ -170,6 +212,10 @@ namespace
 
         GetEngineState()->mSystem.mGsGlobal = sGsGlobal;
 
+        // Install the vblank-yield interrupt so GFX_EndFrame can sleep the EE for
+        // vsync instead of busy-spinning (keeps the emulated IOP / audsrv fed).
+        InstallVblankYield();
+
         LogDebug("[PS2] gsKit initialised: %dx%d NTSC, GS_PSM_CT24, double-buffered "
                  "(both buffers seeded with clear color)",
                  sGsGlobal->Width, sGsGlobal->Height);
@@ -206,7 +252,39 @@ void GFX_EndFrame()
 {
     if (sGsGlobal == nullptr) return;
     gsKit_queue_exec(sGsGlobal);
-    gsKit_sync_flip(sGsGlobal);
+
+    // Sleep the EE until vblank on the interrupt semaphore instead of letting
+    // gsKit_sync_flip busy-spin the whole frame — that spin starves the emulated
+    // IOP on PCSX2 and slows audsrv/SPU2 ~15x (see InstallVblankYield). We then do
+    // gsKit's own flip, decomposed: gsKit_sync_flip == vsync_wait + display_buffer
+    // + switch_context + setactive, so replacing only the vsync_wait with WaitSema
+    // keeps rendering identical while yielding the EE.
+    if (sVblankSema >= 0)
+    {
+        // Exact replica of gsKit_sync_flip with only gsKit_vsync_wait's busy-spin
+        // replaced by the yielding WaitSema. gsKit_sync_flip toggles ONLY
+        // ActiveBuffer — it does NOT touch PrimContext. (My earlier use of
+        // gsKit_switch_context ALSO flipped PrimContext every frame, which swapped
+        // the primitive context and made the 2D/UI path flash while 3D survived.)
+        // Drain any stale/backlogged vblank signals first, THEN wait for the next
+        // real vblank. Without the drain, a leftover signal (e.g. accumulated during
+        // a scene-load pause, or produced faster than consumed) makes WaitSema return
+        // instantly, so the EE free-runs at >60fps with ~0 idle and the IOP/audio
+        // starves (post-load choppy audio).
+        while (PollSema(sVblankSema) >= 0) { }
+        WaitSema(sVblankSema);            // sleep until the NEXT vblank (feeds IOP/audio)
+
+        if (sGsGlobal->DoubleBuffering == GS_SETTING_ON)
+        {
+            gsKit_display_buffer(sGsGlobal);   // GS_SET_DISPFB2: show the buffer we drew
+            sGsGlobal->ActiveBuffer ^= 1;      // flip to the other buffer (ActiveBuffer only)
+        }
+        gsKit_setactive(sGsGlobal);            // write FRAME regs for the new active buffer
+    }
+    else
+    {
+        gsKit_sync_flip(sGsGlobal);       // fallback if the vblank sema failed to install
+    }
 
     // Tell the texture manager we're starting a new frame — it bookkeeps
     // VRAM residency so cold textures get evicted before warm ones.
@@ -251,7 +329,7 @@ void GFX_EndRenderPass() {}
 void GFX_SetPipelineState(PipelineConfig /*config*/) {}
 void GFX_SetViewport(int32_t /*x*/, int32_t /*y*/, int32_t /*w*/, int32_t /*h*/, bool) {}
 void GFX_SetScissor(int32_t /*x*/, int32_t /*y*/, int32_t /*w*/, int32_t /*h*/, bool) {}
-void GFX_SetFog(const FogSettings& /*fogSettings*/) {}
+void GFX_SetFog(const FogSettings& fogSettings) { sFog = fogSettings; }
 void GFX_DrawLines(const std::vector<Line>& /*lines*/) {}
 void GFX_DrawFullscreen() {}
 void GFX_ResizeWindow() {}
@@ -600,6 +678,16 @@ namespace
         }
         return &it->second;
     }
+
+    // Effective MaterialLite for any mesh comp: the comp's material override, else
+    // its default, else the renderer's default white material. Same downcast pattern
+    // as GetMeshTexture (Material::AsLite — no RTTI on PS2 EE GCC).
+    template<typename T>
+    MaterialLite* ResolveMaterialLite(T* comp)
+    {
+        Material* base = comp ? comp->GetMaterial() : nullptr;
+        return Material::AsLite(base ? base : Renderer::Get()->GetDefaultMaterial());
+    }
 }
 
 // ----- Lighting (CPU per-vertex Lambert) ----------------------------------
@@ -610,62 +698,116 @@ namespace
 // (no inverse-transpose — non-uniform scale will skew, acceptable for v1).
 namespace
 {
-    struct PointLightish
+    // Max point lights evaluated per vertex on the EE. Point-lit scenes rarely
+    // need more, and attenuation zeroes distant ones anyway. Kept small because
+    // this is a CPU per-vertex loop (cost = verts × lights).
+    constexpr int kMaxPointLights = 4;
+
+    struct PointLightCPU
     {
-        glm::vec3 mDir   = glm::vec3(0.0f, -1.0f, 0.0f); // world-space direction
-        glm::vec3 mColor = glm::vec3(1.0f, 1.0f, 1.0f);
-        bool      mFound = false;
+        glm::vec3 mPos    = glm::vec3(0.0f);
+        glm::vec3 mColor  = glm::vec3(0.0f);   // GetColor()*intensity (no colorScale)
+        float     mRadius = 0.0f;
     };
 
-    PointLightish GatherMainLight(World* world)
+    // Everything the CPU vertex shader needs for one frame: world ambient, one
+    // directional light, and up to kMaxPointLights point lights.
+    struct SceneLighting
     {
-        PointLightish out;
+        glm::vec3     mAmbient   = glm::vec3(0.1f, 0.1f, 0.1f);  // DEFAULT_AMBIENT_LIGHT_COLOR
+        glm::vec3     mDir       = glm::vec3(0.0f, -1.0f, 0.0f); // world-space travel direction
+        glm::vec3     mDirColor  = glm::vec3(0.0f);
+        bool          mHasDir    = false;
+        PointLightCPU mPoints[kMaxPointLights];
+        int           mNumPoints = 0;
+    };
+
+    SceneLighting GatherLighting(World* world)
+    {
+        SceneLighting out;
         if (world == nullptr) return out;
-        DirectionalLight3D* light = world->FindNode<DirectionalLight3D>();
-        if (light == nullptr) return out;
-        glm::vec3 dir = light->GetDirection();
-        if (glm::length(dir) > 0.0001f) out.mDir = glm::normalize(dir);
-        const glm::vec4 col = light->GetColor();
-        out.mColor = glm::vec3(col.r, col.g, col.b);
-        out.mFound = true;
+        // Ambient AS-IS, no colorScale (pre-scaling saturates to white —
+        // project_psp_lighting_ambient_saturation).
+        out.mAmbient = glm::vec3(world->GetAmbientLightColor());
+
+        // Directional: first DirectionalLight3D. FindNode walks the node tree so it
+        // finds Static-domain lights, which Renderer::GetLightData drops in packaged
+        // (non-editor) builds. Color = GetColor()*intensity, NO colorScale (desktop
+        // Forward.frag:188 applies none to lights; ×colorScale over-brightens → white).
+        DirectionalLight3D* dl = world->FindNode<DirectionalLight3D>();
+        if (dl != nullptr)
+        {
+            const glm::vec3 d = dl->GetDirection();
+            if (glm::length(d) > 0.0001f) out.mDir = glm::normalize(d);
+            out.mDirColor = glm::vec3(dl->GetColor()) * dl->GetIntensity();
+            out.mHasDir   = true;
+        }
+
+        // Point lights: World::GetLights() is the raw, unculled light registry (all
+        // domains). Cap at kMaxPointLights; range attenuation zeroes out-of-reach
+        // ones, so a simple first-N selection is acceptable at PS2 scene scale.
+        const std::vector<Light3D*>& lights = world->GetLights();
+        for (uint32_t i = 0; i < lights.size() && out.mNumPoints < kMaxPointLights; ++i)
+        {
+            Light3D* L = lights[i];
+            if (L == nullptr || !L->IsPointLight3D() || !L->IsVisible()) continue;
+            PointLight3D* pl = L->As<PointLight3D>();
+            if (pl == nullptr) continue;
+            PointLightCPU& p = out.mPoints[out.mNumPoints++];
+            p.mPos    = pl->GetWorldPosition();
+            p.mColor  = glm::vec3(pl->GetColor()) * pl->GetIntensity();
+            p.mRadius = pl->GetRadius();
+        }
         return out;
     }
 
-    // Compute the modulation color for one vertex: clamp(N·L, 0..1) * lightCol
-    // + ambient. Alpha 0x80 = gsKit identity = "use texel alpha verbatim";
-    // anything less attenuates source alpha. (Was 0x00 in earlier passes
-    // when no alpha blend was wired up — became "fully transparent" once we
-    // enabled real src-over blending for font glyph mask support.)
-    inline u64 ShadeVertex(const glm::vec3& normalWS, const PointLightish& light)
+    // HDR per-vertex lit color = ambient + directional Lambert + Σ point-light
+    // Lambert with linear range attenuation (matches desktop Forward.frag:204
+    // `1 - clamp(dist/radius)`). May exceed 1.0 — the caller carries it through the
+    // GS overbright MODULATE. worldPos only matters when point lights are present.
+    inline glm::vec3 ComputeLighting(const glm::vec3& normalWS,
+                                     const glm::vec3& worldPos,
+                                     const SceneLighting& L)
     {
-        constexpr float kAmbient = 0.25f;
-        float dotNL = light.mFound ? -glm::dot(normalWS, light.mDir) : 1.0f;
-        // NaN/Inf trap: if any vertex normal or light dir snuck through as
-        // garbage, dot produces NaN, then clamp + multiply propagate it,
-        // then (u32)(NaN * 0x80) is undefined per C++ spec and typically
-        // resolves to 0 (cube renders black) or 0xFFFFFFFF (full bright).
-        // Either looks like a single-frame lighting glitch on an animated
-        // mesh. Detect + neutralize before it reaches the cast.
-        if (!(dotNL == dotNL))   // true when NaN
+        glm::vec3 col = L.mAmbient;
+        if (L.mHasDir)
         {
-            dotNL = 1.0f;
+            float nl = -glm::dot(normalWS, L.mDir);
+            if (!(nl == nl)) nl = 0.0f;                          // NaN guard (bad normals)
+            col += L.mDirColor * glm::clamp(nl, 0.0f, 1.0f);
         }
-        const float n_dot_l = glm::clamp(dotNL, 0.0f, 1.0f);
-        glm::vec3 col = light.mColor * (kAmbient + (1.0f - kAmbient) * n_dot_l);
-        col = glm::clamp(col, glm::vec3(0.0f), glm::vec3(1.0f));
-        const u32 r = (u32)(col.r * 0x80);
-        const u32 g = (u32)(col.g * 0x80);
-        const u32 b = (u32)(col.b * 0x80);
-        // Alpha 0xFF (overbright) instead of 0x80 (identity). The GS blend
-        // equation `(Cs-Cd)*As+Cd` interprets source alpha via /128, so
-        // 0xFF → As=255/128≈2.0 saturated to 1.0 → guaranteed opaque
-        // output. With 0x80 modulation, a texel with alpha < 255 (mipmap
-        // artifact, PNG decoder quirk, padding band edge) produced partial
-        // blend with the framebuffer — that's what generated the
-        // cube's "lighting flicker" symptom (darker with sky behind,
-        // half-bright with clear color behind). Forcing alpha overbright
-        // makes 3D mesh draws blend-immune regardless of texel alpha.
-        return GS_SETREG_RGBAQ(r, g, b, 0xFF, 0);
+        for (int i = 0; i < L.mNumPoints; ++i)
+        {
+            const glm::vec3 toL  = L.mPoints[i].mPos - worldPos;
+            const float     dist = glm::length(toL);
+            const float     r    = L.mPoints[i].mRadius;
+            const float     atten = (r > 0.0001f) ? glm::clamp(1.0f - dist / r, 0.0f, 1.0f) : 0.0f;
+            if (atten <= 0.0f) continue;
+            float nl = glm::dot(normalWS, toL / glm::max(dist, 0.0001f));
+            if (!(nl == nl)) nl = 0.0f;
+            col += L.mPoints[i].mColor * (glm::clamp(nl, 0.0f, 1.0f) * atten);
+        }
+        return col;
+    }
+
+    // Pack an HDR modulation color (~[0,2]) into a GS RGBAQ via the overbright
+    // MODULATE range (fragment = texel * Cf/128, Cf∈[0,255] → mod ∈[0,~2.0]). This
+    // carries the HDR lighting range through so a bright ambient + directional does
+    // NOT saturate to white and lose contrast. `alpha` is the raw GS alpha byte:
+    // 0xFF forces opaque (opaque/masked path — texel-alpha-immune, kills the old
+    // cube "lighting flicker"); opacity*128 for translucent/additive draws.
+    inline u64 PackModColor(const glm::vec3& c, u32 alpha)
+    {
+        auto pk = [](float v) -> u32 { return (u32)glm::clamp((int)(v * 128.0f), 0, 255); };
+        return GS_SETREG_RGBAQ(pk(c.r), pk(c.g), pk(c.b), alpha, 0);
+    }
+
+    // Unpack a packed RGBA8888 vertex color (R in low byte) to linear [0,1] RGB.
+    inline glm::vec3 UnpackVertexColorRGB(uint32_t c)
+    {
+        return glm::vec3((c & 0xFF) / 255.0f,
+                         ((c >> 8) & 0xFF) / 255.0f,
+                         ((c >> 16) & 0xFF) / 255.0f);
     }
 
     // Same alpha-overbright trick — opaque pass-through for unlit 3D
@@ -704,6 +846,173 @@ namespace
     }
 }
 
+// ----- GS hardware fog ----------------------------------------------------
+// PS2 GS blends the post-texture fragment toward FOGCOL by (1 - F/255), where F
+// is a per-vertex coefficient carried in XYZF2 and the PRIM FGE bit enables it.
+// gsKit's prim helpers only emit XYZ2 (no F), so we replicate their GIF packets
+// (RGBAQ [+ UV] + XYZF2) verbatim from gsPrimitive.c / gsTexture.c, substituting
+// XYZF2 for XYZ2 and providing the fog coefficient. Works on textured meshes,
+// which per-vertex modulation color cannot fog.
+namespace
+{
+    // Unique GIF batch types so fog triangles never merge with non-fog prims.
+    constexpr int kGifPrimTriGouraudFog = 0x1801;   // vs GSKIT_GIF_PRIM_TRIANGLE_GOURAUD 0x1800
+
+    // REGLISTs = gsKit's, with GS_XYZF2 in place of GS_XYZ2.
+    inline u64 FogGouraudRegs()
+    {
+        return ((u64)(GS_PRIM)  << 0)  | ((u64)(GS_RGBAQ) << 4)  |
+               ((u64)(GS_XYZF2) << 8)  | ((u64)(GS_RGBAQ) << 12) |
+               ((u64)(GS_XYZF2) << 16) | ((u64)(GS_RGBAQ) << 20) |
+               ((u64)(GS_XYZF2) << 24) | ((u64)(GIF_NOP)  << 28);
+    }
+    inline u64 FogTexGouraudRegs(int ctx)
+    {
+        return ((u64)(GS_TEX0_1 + ctx) << 0)  | ((u64)(GS_PRIM)  << 4)  |
+               ((u64)(GS_RGBAQ)        << 8)  | ((u64)(GS_UV)     << 12) |
+               ((u64)(GS_XYZF2)        << 16) | ((u64)(GS_RGBAQ)  << 20) |
+               ((u64)(GS_UV)           << 24) | ((u64)(GS_XYZF2)  << 28) |
+               ((u64)(GS_RGBAQ)        << 32) | ((u64)(GS_UV)     << 36) |
+               ((u64)(GS_XYZF2)        << 40) | ((u64)(GIF_NOP)   << 44);
+    }
+
+    // Per-vertex fog coefficient F (0=full fog .. 255=clear) from eye-space depth.
+    inline int FogCoefficient(float depth)
+    {
+        const float span = sFog.mFar - sFog.mNear;
+        float t;
+        if (span <= 0.0001f)
+        {
+            t = (depth >= sFog.mFar) ? 1.0f : 0.0f;
+        }
+        else if (sFog.mDensityFunc == FogDensityFunc::Exponential)
+        {
+            // No authored density scalar; shape an exp ramp from near/far so
+            // t≈0.95 at far (exp(-3)≈0.05). Matches the C3D/GX spirit.
+            const float d = (depth < sFog.mNear) ? 0.0f : (depth - sFog.mNear);
+            t = 1.0f - expf(-(3.0f / span) * d);
+        }
+        else
+        {
+            t = (depth - sFog.mNear) / span;   // Linear
+        }
+        t = glm::clamp(t, 0.0f, 1.0f);
+        t *= sFog.mColor.a;                       // fog-color alpha scales overall density (matches Fog.glsl)
+        return (int)((1.0f - t) * 255.0f);
+    }
+
+    // Skybox fog coefficient — horizon gradient, NOT distance (mirrors Fog.glsl
+    // ApplyFogSky). Distance fog on the sky is meaningless (it sits far past the fog
+    // Far plane, so distance fog would flood the whole dome one flat color and the
+    // sky vanishes). Instead fade by the view-ray elevation: full fog at/below the
+    // horizon, clearing toward the zenith — so fogged distant terrain blends
+    // seamlessly into the sky. `localPos` is the skybox vertex in model space.
+    inline int SkyFogCoefficient(const glm::mat4& model, const glm::vec3& localPos,
+                                 const glm::vec3& camPos)
+    {
+        const glm::vec3 worldPos = glm::vec3(model * glm::vec4(localPos, 1.0f));
+        const glm::vec3 d = worldPos - camPos;
+        const float len = glm::length(d);
+        const float dy = (len > 1e-6f) ? (d.y / len) : 1.0f;   // normalized elevation, ~0 at horizon
+        constexpr float kHorizonFalloff = 0.25f;               // ~14° fade band above the horizon
+        const float t = glm::clamp(dy / kHorizonFalloff, 0.0f, 1.0f);
+        const float s = t * t * (3.0f - 2.0f * t);             // smoothstep(0,1,t)
+        const float fogFactor = (1.0f - s) * sFog.mColor.a;    // 1 = full fog (horizon), 0 = clear (zenith)
+        return (int)((1.0f - fogFactor) * 255.0f);             // F: 0 = full fog, 255 = clear
+    }
+
+    // log2 (rounded up) of a texture dimension, for the TEX0 TW/TH fields.
+    // gsKit's own gsKit_set_tw_th is static/private, so we compute it (engine
+    // PS2 textures are already power-of-two, so this is exact).
+    inline int TexLog2(int v)
+    {
+        int r = 0;
+        while ((1 << r) < v) ++r;
+        return r;
+    }
+
+    // Program FOGCOL (register 0x3d) via a queued A+D packet. Cheap; call once
+    // before a fog-enabled mesh's triangles.
+    inline void WriteFogColor(const glm::vec4& c)
+    {
+        const u32 r = (u32)(glm::clamp(c.r, 0.0f, 1.0f) * 255.0f);
+        const u32 g = (u32)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
+        const u32 b = (u32)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+        u64* p = (u64*)gsKit_heap_alloc(sGsGlobal, 1, 16, GIF_AD);
+        *p++ = GIF_TAG_AD(1);
+        *p++ = GIF_AD;
+        *p++ = ((u64)r | ((u64)g << 8) | ((u64)b << 16));   // FOGCOL value
+        *p++ = GS_FOGCOL;                                    // register address
+    }
+
+    // Fog variant of gsKit_prim_triangle_gouraud_3d (untextured).
+    void PrimTriGouraudFog(float x1, float y1, int iz1, int f1,
+                           float x2, float y2, int iz2, int f2,
+                           float x3, float y3, int iz3, int f3,
+                           u64 c1, u64 c2, u64 c3)
+    {
+        const int ix1 = gsKit_float_to_int_x(sGsGlobal, x1), iy1 = gsKit_float_to_int_y(sGsGlobal, y1);
+        const int ix2 = gsKit_float_to_int_x(sGsGlobal, x2), iy2 = gsKit_float_to_int_y(sGsGlobal, y2);
+        const int ix3 = gsKit_float_to_int_x(sGsGlobal, x3), iy3 = gsKit_float_to_int_y(sGsGlobal, y3);
+
+        u64* p_store;
+        u64* p_data;
+        p_store = p_data = (u64*)gsKit_heap_alloc(sGsGlobal, 4, 64, kGifPrimTriGouraudFog);
+        if (p_store == (u64*)sGsGlobal->CurQueue->last_tag)
+        {
+            *p_data++ = GIF_TAG_TRIANGLE_GOURAUD(0);
+            *p_data++ = FogGouraudRegs();
+        }
+        *p_data++ = GS_SETREG_PRIM(GS_PRIM_PRIM_TRIANGLE, 1, 0,
+            sGsGlobal->PrimFogEnable, sGsGlobal->PrimAlphaEnable,
+            sGsGlobal->PrimAAEnable, 0, sGsGlobal->PrimContext, 0);
+        *p_data++ = c1; *p_data++ = GS_SETREG_XYZF2(ix1, iy1, iz1, f1);
+        *p_data++ = c2; *p_data++ = GS_SETREG_XYZF2(ix2, iy2, iz2, f2);
+        *p_data++ = c3; *p_data++ = GS_SETREG_XYZF2(ix3, iy3, iz3, f3);
+    }
+
+    // Fog variant of gsKit_prim_triangle_goraud_texture_3d. gsKit_set_texfilter
+    // (as in the original) resets last_type so the always-written tag is correct.
+    void PrimTriTexGouraudFog(GSTEXTURE* tex,
+        float x1, float y1, int iz1, float u1, float v1, int f1,
+        float x2, float y2, int iz2, float u2, float v2, int f2,
+        float x3, float y3, int iz3, float u3, float v3, int f3,
+        u64 c1, u64 c2, u64 c3)
+    {
+        gsKit_set_texfilter(sGsGlobal, tex->Filter);
+        const int tw = TexLog2(tex->Width);
+        const int th = TexLog2(tex->Height);
+
+        const int ix1 = gsKit_float_to_int_x(sGsGlobal, x1), iy1 = gsKit_float_to_int_y(sGsGlobal, y1);
+        const int ix2 = gsKit_float_to_int_x(sGsGlobal, x2), iy2 = gsKit_float_to_int_y(sGsGlobal, y2);
+        const int ix3 = gsKit_float_to_int_x(sGsGlobal, x3), iy3 = gsKit_float_to_int_y(sGsGlobal, y3);
+        const int iu1 = gsKit_float_to_int_u(tex, u1), iv1 = gsKit_float_to_int_v(tex, v1);
+        const int iu2 = gsKit_float_to_int_u(tex, u2), iv2 = gsKit_float_to_int_v(tex, v2);
+        const int iu3 = gsKit_float_to_int_u(tex, u3), iv3 = gsKit_float_to_int_v(tex, v3);
+
+        u64* p_data = (u64*)gsKit_heap_alloc(sGsGlobal, 6, 96, GSKIT_GIF_PRIM_TRIANGLE_TEXTURED);
+        *p_data++ = GIF_TAG_TRIANGLE_GORAUD_TEXTURED(0);
+        *p_data++ = FogTexGouraudRegs(sGsGlobal->PrimContext);
+        if (tex->VramClut == 0)
+        {
+            *p_data++ = GS_SETREG_TEX0(tex->Vram / 256, tex->TBW, tex->PSM, tw, th,
+                sGsGlobal->PrimAlphaEnable, 0, 0, 0, 0, 0, GS_CLUT_STOREMODE_NOLOAD);
+        }
+        else
+        {
+            *p_data++ = GS_SETREG_TEX0(tex->Vram / 256, tex->TBW, tex->PSM, tw, th,
+                sGsGlobal->PrimAlphaEnable, 0, tex->VramClut / 256, tex->ClutPSM,
+                tex->ClutStorageMode, 0, GS_CLUT_STOREMODE_LOAD);
+        }
+        *p_data++ = GS_SETREG_PRIM(GS_PRIM_PRIM_TRIANGLE, 1, 1,
+            sGsGlobal->PrimFogEnable, sGsGlobal->PrimAlphaEnable,
+            sGsGlobal->PrimAAEnable, 1, sGsGlobal->PrimContext, 0);
+        *p_data++ = c1; *p_data++ = GS_SETREG_UV(iu1, iv1); *p_data++ = GS_SETREG_XYZF2(ix1, iy1, iz1, f1);
+        *p_data++ = c2; *p_data++ = GS_SETREG_UV(iu2, iv2); *p_data++ = GS_SETREG_XYZF2(ix2, iy2, iz2, f2);
+        *p_data++ = c3; *p_data++ = GS_SETREG_UV(iu3, iv3); *p_data++ = GS_SETREG_XYZF2(ix3, iy3, iz3, f3);
+    }
+}
+
 // ----- Helper: transform + cull + submit a triangle-list mesh -------------
 // Used by static, instanced, and skeletal mesh draws — all three share the
 // same vertex→screen pipeline post-skinning/transforms.
@@ -714,24 +1023,84 @@ namespace
                         const glm::mat4& model,
                         const glm::mat4& mvp,
                         Ps2TextureData* texSlot,
-                        const PointLightish& light,
+                        const SceneLighting& light,
                         bool unlit,
-                        bool invertCull)
+                        bool invertCull,
+                        MaterialLite* mat = nullptr,
+                        const std::vector<VertexColor>* colorVerts = nullptr)
     {
-        if (sGsGlobal == nullptr || verts.empty() || indices.empty()) return;
+        // Vertex source: either the plain Vertex vector (static/skeletal/instanced/
+        // text) or a VertexColor vector (vertex-colored static meshes). hasColor
+        // meshes were previously invisible because they populate mVerticesColor but
+        // this helper only ever read `verts` (empty for them). Route both through
+        // per-index accessors so both draw and colored verts can modulate.
+        const bool   hasColor = (colorVerts != nullptr);
+        const size_t vcount   = hasColor ? colorVerts->size() : verts.size();
+        if (sGsGlobal == nullptr || vcount == 0 || indices.empty()) return;
 
-        // 3D meshes always render opaque — disable PRIM's ABE bit for the
-        // duration of this draw. gsKit reads gsGlobal->PrimAlphaEnable when
-        // emitting the PRIM register for each prim call, so toggling here
-        // sets every subsequent prim to ABE=0. The cube's intermittent
-        // "lighting flicker" symptom (darker with sky, half-bright without)
-        // was the cube alpha-blending with the framebuffer on some frames
-        // even though my computed RGBA was provably stable — the GS was
-        // re-blending the modulated output with dst in some way our
-        // stable-input math couldn't influence. Skipping blend at the PRIM
-        // level eliminates that variable entirely. UI draws re-enable
-        // PrimAlphaEnable below for the font glyph mask blend they need.
-        sGsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
+        auto vPos = [&](uint32_t i) -> glm::vec3 { return hasColor ? (*colorVerts)[i].mPosition  : verts[i].mPosition; };
+        auto vNrm = [&](uint32_t i) -> glm::vec3 { return hasColor ? (*colorVerts)[i].mNormal    : verts[i].mNormal; };
+        auto vUV  = [&](uint32_t i) -> glm::vec2 { return hasColor ? (*colorVerts)[i].mTexcoord0 : verts[i].mTexcoord0; };
+        auto vCol = [&](uint32_t i) -> uint32_t  { return hasColor ? (*colorVerts)[i].mColor     : 0xFFFFFFFFu; };
+
+        // Material render state (tint/emissive/blend/cull/vertex-color). Null → the
+        // engine default (white opaque, back-face cull, no emissive/vertex color).
+        glm::vec3 matTint(1.0f);
+        float     matEmission = 0.0f;
+        BlendMode blend = BlendMode::Opaque;
+        CullMode  cull  = CullMode::Back;
+        bool      vcModulate = false;
+        if (mat != nullptr)
+        {
+            matTint     = glm::vec3(mat->GetColor());
+            matEmission = mat->GetEmission();
+            blend       = mat->GetBlendMode();
+            cull        = mat->GetCullMode();
+            vcModulate  = (mat->GetVertexColorMode() != VertexColorMode::None) && hasColor;
+        }
+        const bool  translucent = (blend == BlendMode::Translucent || blend == BlendMode::Additive);
+        const float opacity     = (translucent && mat != nullptr) ? mat->GetOpacity() : 1.0f;
+        // Alpha byte fed to every vertex. Opaque/Masked → 0xFF (overbright = force
+        // opaque, texel-alpha-immune, kills the cube "lighting flicker"). Translucent/
+        // additive → opacity*128 so the GS blend equation sees As = opacity.
+        const u32 alphaByte = translucent
+            ? (u32)glm::clamp((int)(opacity * 128.0f), 0, 255)
+            : 0xFFu;
+
+        // Blend enable (ABE bit in PRIM, read by gsKit AND our fog packets from
+        // sGsGlobal->PrimAlphaEnable). Opaque/Masked stay unblended; the GS ALPHA
+        // equation for translucent vs additive is selected below.
+        sGsGlobal->PrimAlphaEnable = translucent ? GS_SETTING_ON : GS_SETTING_OFF;
+        if (translucent)
+        {
+            // Translucent: src-over (Cs-Cd)*As+Cd. Additive: Cs*As+Cd (B=0/"2", D=Cd).
+            const u64 alphaReg = (blend == BlendMode::Additive)
+                ? GS_SETREG_ALPHA(0, 2, 0, 1, 0x80)   // Cs*As + Cd
+                : GS_SETREG_ALPHA(0, 1, 0, 1, 0x80);  // (Cs-Cd)*As + Cd
+            gsKit_set_primalpha(sGsGlobal, alphaReg, 0);
+        }
+
+        // Fog: enable the PRIM FGE bit for this draw (per-vertex F below) and set
+        // the fog color once. gsKit reads PrimFogEnable when emitting PRIM, so the
+        // non-fog gsKit prim path must see it OFF (else stale F fogs everything).
+        // The skybox (invertCull) gets fog too, but via a HORIZON gradient
+        // (SkyFogCoefficient) instead of distance — distance fog on the sky floods
+        // the whole dome flat and the sky vanishes. Horizon fog fades the sky to the
+        // fog color at the horizon so fogged distant geometry blends into it.
+        const bool fog    = sFog.mEnabled;
+        const bool skyFog = fog && invertCull;
+        sGsGlobal->PrimFogEnable = fog ? GS_SETTING_ON : GS_SETTING_OFF;
+        glm::vec3 fogCamPos(0.0f);
+        if (fog)
+        {
+            WriteFogColor(sFog.mColor);
+            if (skyFog)
+            {
+                World* fw = GetWorld(0);
+                Camera3D* fc = fw ? fw->GetActiveCamera() : nullptr;
+                if (fc != nullptr) fogCamPos = fc->GetWorldPosition();
+            }
+        }
 
         // Bind texture once for the whole mesh, and apply its wrap mode
         // (engine Texture::GetWrapMode → gsKit GS_CMODE_*). gsKit's clamp
@@ -765,9 +1134,10 @@ namespace
             const uint32_t i1 = indices[t * 3 + 1];
             const uint32_t i2 = indices[t * 3 + 2];
 
-            const glm::vec4 p0 = mvp * glm::vec4(verts[i0].mPosition, 1.0f);
-            const glm::vec4 p1 = mvp * glm::vec4(verts[i1].mPosition, 1.0f);
-            const glm::vec4 p2 = mvp * glm::vec4(verts[i2].mPosition, 1.0f);
+            const glm::vec3 lp0 = vPos(i0), lp1 = vPos(i1), lp2 = vPos(i2);
+            const glm::vec4 p0 = mvp * glm::vec4(lp0, 1.0f);
+            const glm::vec4 p1 = mvp * glm::vec4(lp1, 1.0f);
+            const glm::vec4 p2 = mvp * glm::vec4(lp2, 1.0f);
             if (p0.w <= 0.0f || p1.w <= 0.0f || p2.w <= 0.0f) continue;
 
             const float invW0 = 1.0f / p0.w, invW1 = 1.0f / p1.w, invW2 = 1.0f / p2.w;
@@ -796,59 +1166,114 @@ namespace
             // momentarily disappear when they're edge-on. Cull anything
             // within ±0.5 px² of zero; visually those triangles cover less
             // than a pixel anyway.
-            const float signedArea = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-            constexpr float kCullEpsilon = 0.5f;
-            if (invertCull
-                ? (signedArea <=  kCullEpsilon)
-                : (signedArea >= -kCullEpsilon))
+            // Two-sided materials (CullMode::None) skip the test entirely; Front
+            // culling inverts it. invertCull (skybox) also inverts. XOR combines
+            // the two inversions.
+            if (cull != CullMode::None)
             {
-                continue;
+                const bool invert = invertCull ^ (cull == CullMode::Front);
+                const float signedArea = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+                constexpr float kCullEpsilon = 0.5f;
+                if (invert
+                    ? (signedArea <=  kCullEpsilon)
+                    : (signedArea >= -kCullEpsilon))
+                {
+                    continue;
+                }
             }
 
             const int iz0 = (int)((1.0f - nz0) * 16383.5f);
             const int iz1 = (int)((1.0f - nz1) * 16383.5f);
             const int iz2 = (int)((1.0f - nz2) * 16383.5f);
 
+            // Per-vertex modulation color = materialTint * lighting + emissive,
+            // optionally × the baked vertex color. Unlit meshes skip Lambert
+            // (lighting == 1). The result is packed through the GS overbright range.
+            // Emissive (MaterialLite::GetEmission scalar) is an additive self-lit
+            // term = tint*emission, so it shows even in shadow / on unlit materials.
+            auto shade = [&](uint32_t idx, const glm::vec3& nWS, const glm::vec3& wPos) -> u64 {
+                const glm::vec3 lit = unlit ? glm::vec3(1.0f)
+                                            : ComputeLighting(nWS, wPos, light);
+                glm::vec3 modc = matTint * lit + matTint * matEmission;
+                if (vcModulate) modc *= UnpackVertexColorRGB(vCol(idx));
+                return PackModColor(modc, alphaByte);
+            };
+
             u64 c0, c1, c2;
             if (unlit)
             {
-                // No Lambert — texture displays at full intensity.
-                c0 = c1 = c2 = UnlitModulationColor();
+                // No Lambert — but still honor tint / emissive / vertex color.
+                c0 = shade(i0, glm::vec3(0.0f), glm::vec3(0.0f));
+                c1 = shade(i1, glm::vec3(0.0f), glm::vec3(0.0f));
+                c2 = shade(i2, glm::vec3(0.0f), glm::vec3(0.0f));
             }
             else
             {
-                // NaN-safe normalize: when the model matrix has a
-                // degenerate row at animation extremes (e.g. HeroSpinner
-                // sin-wave touching 0 scale on an axis), normalMat × normal
-                // can collapse to (0,0,0). glm::normalize divides by 0 →
-                // NaN, which through ShadeVertex produces a junk RGBAQ that
-                // the GS interprets as random brightness for that single
-                // frame. Fall back to a known-good "up" normal in that case
-                // — visually indistinguishable from a proper normal on a
-                // single-frame transient.
+                // NaN-safe normalize: a degenerate model row at animation extremes
+                // (e.g. HeroSpinner sin-wave touching 0 scale) collapses normalMat ×
+                // normal to (0,0,0) → glm::normalize NaN → junk RGBAQ. Fall back to
+                // "up"; visually indistinguishable on a single-frame transient.
                 auto safeNormalize = [&](const glm::vec3& v) -> glm::vec3 {
                     const float len2 = glm::dot(v, v);
                     return (len2 > 1e-12f) ? (v / glm::sqrt(len2))
                                            : glm::vec3(0.0f, 1.0f, 0.0f);
                 };
-                const glm::vec3 n0 = safeNormalize(normalMat * verts[i0].mNormal);
-                const glm::vec3 n1 = safeNormalize(normalMat * verts[i1].mNormal);
-                const glm::vec3 n2 = safeNormalize(normalMat * verts[i2].mNormal);
-                c0 = ShadeVertex(n0, light);
-                c1 = ShadeVertex(n1, light);
-                c2 = ShadeVertex(n2, light);
+                const glm::vec3 n0 = safeNormalize(normalMat * vNrm(i0));
+                const glm::vec3 n1 = safeNormalize(normalMat * vNrm(i1));
+                const glm::vec3 n2 = safeNormalize(normalMat * vNrm(i2));
+                // World positions only needed for point-light distance.
+                const bool needWP = (light.mNumPoints > 0);
+                const glm::vec3 w0 = needWP ? glm::vec3(model * glm::vec4(lp0, 1.0f)) : glm::vec3(0.0f);
+                const glm::vec3 w1 = needWP ? glm::vec3(model * glm::vec4(lp1, 1.0f)) : glm::vec3(0.0f);
+                const glm::vec3 w2 = needWP ? glm::vec3(model * glm::vec4(lp2, 1.0f)) : glm::vec3(0.0f);
+                c0 = shade(i0, n0, w0);
+                c1 = shade(i1, n1, w1);
+                c2 = shade(i2, n2, w2);
+            }
+
+            // Per-vertex fog coefficient. 255 = clear (no fog / near), 0 = full fog.
+            // Skybox uses the horizon gradient (elevation); everything else uses
+            // eye-space distance (clip w).
+            int f0 = 255, f1 = 255, f2 = 255;
+            if (skyFog)
+            {
+                f0 = SkyFogCoefficient(model, lp0, fogCamPos);
+                f1 = SkyFogCoefficient(model, lp1, fogCamPos);
+                f2 = SkyFogCoefficient(model, lp2, fogCamPos);
+            }
+            else if (fog)
+            {
+                f0 = FogCoefficient(p0.w);
+                f1 = FogCoefficient(p1.w);
+                f2 = FogCoefficient(p2.w);
             }
 
             if (texSlot != nullptr)
             {
-                const glm::vec2& uv0 = verts[i0].mTexcoord0;
-                const glm::vec2& uv1 = verts[i1].mTexcoord0;
-                const glm::vec2& uv2 = verts[i2].mTexcoord0;
-                gsKit_prim_triangle_goraud_texture_3d(sGsGlobal, &texSlot->mGsTex,
-                    x0, y0, iz0, uv0.x * texW, uv0.y * texH,
-                    x1, y1, iz1, uv1.x * texW, uv1.y * texH,
-                    x2, y2, iz2, uv2.x * texW, uv2.y * texH,
-                    c0, c1, c2);
+                const glm::vec2 uv0 = vUV(i0);
+                const glm::vec2 uv1 = vUV(i1);
+                const glm::vec2 uv2 = vUV(i2);
+                if (fog)
+                {
+                    PrimTriTexGouraudFog(&texSlot->mGsTex,
+                        x0, y0, iz0, uv0.x * texW, uv0.y * texH, f0,
+                        x1, y1, iz1, uv1.x * texW, uv1.y * texH, f1,
+                        x2, y2, iz2, uv2.x * texW, uv2.y * texH, f2,
+                        c0, c1, c2);
+                }
+                else
+                {
+                    gsKit_prim_triangle_goraud_texture_3d(sGsGlobal, &texSlot->mGsTex,
+                        x0, y0, iz0, uv0.x * texW, uv0.y * texH,
+                        x1, y1, iz1, uv1.x * texW, uv1.y * texH,
+                        x2, y2, iz2, uv2.x * texW, uv2.y * texH,
+                        c0, c1, c2);
+                }
+            }
+            else if (fog)
+            {
+                PrimTriGouraudFog(x0, y0, iz0, f0, x1, y1, iz1, f1, x2, y2, iz2, f2,
+                                  c0, c1, c2);
             }
             else
             {
@@ -856,6 +1281,16 @@ namespace
                 gsKit_prim_triangle_gouraud(sGsGlobal,
                     x0, y0, x1, y1, x2, y2, izAvg, c0, c1, c2);
             }
+        }
+
+        // Leave fog disabled so later non-fog draws (particles, UI) that reuse
+        // gsKit's plain XYZ2 prims don't inherit the FGE bit with a stale F.
+        sGsGlobal->PrimFogEnable = GS_SETTING_OFF;
+        // Restore the persistent src-over blend equation if an additive mesh
+        // switched it — the UI font-mask blend (and translucent draws) rely on it.
+        if (translucent && blend == BlendMode::Additive)
+        {
+            gsKit_set_primalpha(sGsGlobal, GS_SETREG_ALPHA(0, 1, 0, 1, 0x80), 0);
         }
     }
 }
@@ -880,11 +1315,16 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     const glm::mat4 model = comp->GetRenderTransform();
     const glm::mat4 mvp   = camera->GetViewProjectionMatrix() * model;
     Ps2TextureData* texSlot = GetMeshTexture(comp, mesh);
-    PointLightish light = GatherMainLight(world);
+    SceneLighting light  = GatherLighting(world);
+    MaterialLite* mat    = ResolveMaterialLite(comp);
     const bool isSkybox  = comp->As<Skybox3D>() != nullptr;
     const bool wantUnlit = IsCompUnlit(comp) || isSkybox;  // sky = no lighting
 
-    DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light, wantUnlit, isSkybox);
+    // Vertex-colored meshes store verts in mVerticesColor (mVertices is empty);
+    // pass that as the color-vertex source so they draw (and can modulate color).
+    const std::vector<VertexColor>* colorVerts = data.mHasColor ? &data.mVerticesColor : nullptr;
+    DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light,
+                   wantUnlit, isSkybox, mat, colorVerts);
 }
 
 // =========================================================================
@@ -969,8 +1409,9 @@ void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* c)
         if (it != sTextures.end()) texSlot = &it->second;
     }
 
-    PointLightish light = GatherMainLight(world);
-    DrawTrisHelper(itVerts->second, itIdx->second, model, mvp, texSlot, light, IsCompUnlit(c), /*invertCull=*/false);
+    SceneLighting light = GatherLighting(world);
+    DrawTrisHelper(itVerts->second, itIdx->second, model, mvp, texSlot, light,
+                   IsCompUnlit(c), /*invertCull=*/false, mat);
 }
 
 bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*c*/)
@@ -1017,7 +1458,7 @@ void GFX_DrawInstancedMeshComp(InstancedMesh3D* comp)
         if (it != sTextures.end()) texSlot = &it->second;
     }
 
-    PointLightish light    = GatherMainLight(world);
+    SceneLighting light    = GatherLighting(world);
     const glm::mat4 vp     = camera->GetViewProjectionMatrix();
     const glm::mat4 compTr = comp->GetRenderTransform();
 
@@ -1026,7 +1467,8 @@ void GFX_DrawInstancedMeshComp(InstancedMesh3D* comp)
     {
         const glm::mat4 model = compTr * comp->CalculateInstanceTransform((int32_t)i);
         const glm::mat4 mvp   = vp * model;
-        DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light, unlit, /*invertCull=*/false);
+        DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light,
+                       unlit, /*invertCull=*/false, mat);
     }
 }
 
@@ -1138,6 +1580,12 @@ namespace
         const glm::mat4 mvp = camera->GetViewProjectionMatrix() * model;
 
         sGsGlobal->PrimAlphaEnable = GS_SETTING_ON;
+        const bool fog = sFog.mEnabled;
+        sGsGlobal->PrimFogEnable = fog ? GS_SETTING_ON : GS_SETTING_OFF;
+        if (fog)
+        {
+            WriteFogColor(sFog.mColor);
+        }
         if (texSlot != nullptr)
         {
             gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
@@ -1175,16 +1623,36 @@ namespace
             const int iz1 = (int)((1.0f - nz1) * 16383.5f);
             const int iz2 = (int)((1.0f - nz2) * 16383.5f);
 
+            const int f0 = fog ? FogCoefficient(p0.w) : 255;
+            const int f1 = fog ? FogCoefficient(p1.w) : 255;
+            const int f2 = fog ? FogCoefficient(p2.w) : 255;
+
             if (texSlot != nullptr)
             {
                 const glm::vec2& uv0 = data.mVerts[i0].mTexcoord0;
                 const glm::vec2& uv1 = data.mVerts[i1].mTexcoord0;
                 const glm::vec2& uv2 = data.mVerts[i2].mTexcoord0;
-                gsKit_prim_triangle_goraud_texture_3d(sGsGlobal, &texSlot->mGsTex,
-                    x0, y0, iz0, uv0.x * texW, uv0.y * texH,
-                    x1, y1, iz1, uv1.x * texW, uv1.y * texH,
-                    x2, y2, iz2, uv2.x * texW, uv2.y * texH,
-                    kIdentity, kIdentity, kIdentity);
+                if (fog)
+                {
+                    PrimTriTexGouraudFog(&texSlot->mGsTex,
+                        x0, y0, iz0, uv0.x * texW, uv0.y * texH, f0,
+                        x1, y1, iz1, uv1.x * texW, uv1.y * texH, f1,
+                        x2, y2, iz2, uv2.x * texW, uv2.y * texH, f2,
+                        kIdentity, kIdentity, kIdentity);
+                }
+                else
+                {
+                    gsKit_prim_triangle_goraud_texture_3d(sGsGlobal, &texSlot->mGsTex,
+                        x0, y0, iz0, uv0.x * texW, uv0.y * texH,
+                        x1, y1, iz1, uv1.x * texW, uv1.y * texH,
+                        x2, y2, iz2, uv2.x * texW, uv2.y * texH,
+                        kIdentity, kIdentity, kIdentity);
+                }
+            }
+            else if (fog)
+            {
+                PrimTriGouraudFog(x0, y0, iz0, f0, x1, y1, iz1, f1, x2, y2, iz2, f2,
+                                  kIdentity, kIdentity, kIdentity);
             }
             else
             {
@@ -1194,6 +1662,9 @@ namespace
                     kIdentity, kIdentity, kIdentity);
             }
         }
+
+        // Leave fog disabled for later non-fog draws (see DrawTrisHelper).
+        sGsGlobal->PrimFogEnable = GS_SETTING_OFF;
     }
 
     // Look up an engine-side texture slot by walking material → texture →
