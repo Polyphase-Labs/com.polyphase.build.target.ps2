@@ -17,11 +17,22 @@ into the user's PS2 ELF, not into the editor.
 - **GS rendering backend** (`Runtime/PS2/Graphics_PS2GS/`) — implements the
   engine's `GFX_*` surface on top of gsKit + dmaKit:
   - NTSC 640×448 framebuffer, 24-bit color + 16-bit Z, interlaced double-buffer
-  - Textured static meshes, vertex-color meshes (TileMap2D / Terrain3D /
-    Voxel3D), particle quads, UI widgets, font text
-  - 3-light directional + ambient lighting via CPU MVP transform + per-vertex
-    Gouraud (PS2 has no programmable shaders; lighting is done EE-side and
-    passed as per-vertex color to the GIF)
+  - Textured & vertex-colored static meshes, skeletal meshes (CPU-skinned),
+    instanced meshes, 3D text meshes, vertex-color meshes (TileMap2D /
+    Terrain3D / Voxel3D), particle quads, UI widgets, font text
+  - **CPU per-vertex lighting** (PS2 has no programmable shaders; shading is done
+    EE-side and passed as per-vertex color to the GIF): world **ambient** +
+    one **directional** light + up to **4 point lights** (linear range
+    attenuation). Lit color is carried through the GS **overbright MODULATE**
+    range so a bright ambient plus directional keeps its contrast instead of
+    saturating to white.
+  - **Material features**: base-color **tint**, **emissive** term, per-vertex
+    **vertex colors** (modulate), **blend modes** (opaque / **masked**
+    alpha-test cutout / **translucent** / **additive**, with depth-writes off
+    for blended draws), and **two-sided** (cull-mode) materials.
+  - **Fog**: GS hardware distance fog (linear / exponential) toward the fog
+    color, plus a **horizon-gradient fog on the skybox** (fades to fog color at
+    the horizon, clear at the zenith — mirrors the desktop `ApplyFogSky`).
 - **System runtime** (`Runtime/PS2/System_PS2.cpp`) — file I/O, threads,
   semaphores, timers via PS2SDK kernel; **memory-card save data** via libmc
   (mcman/mcserv IRX), with icon.sys + browser-visible save folders.
@@ -161,15 +172,21 @@ VRAM allocation (gsKit-managed):
 | Threads, semaphores, timers | OK | PS2SDK kernel — `CreateThread`/`CreateSema`/`GetSystemTime` |
 | Logging | OK | `scr_printf` boot tty + `polyphase.log` on host: or mc0: |
 | **Textured static meshes** | OK | gsKit `gsKit_prim_triangle_goraud_texture_3d`, CPU MVP + per-vertex Gouraud |
-| **Vertex-color meshes** (TileMap2D / Terrain3D / Voxel3D) | OK | Shared `DrawVertexColorMesh` helper, unlit + alpha blend |
+| **Vertex-color static meshes** | OK | `VertexColor` path in `DrawTrisHelper`; baked color modulates lit result |
+| **Vertex-color meshes** (TileMap2D / Terrain3D / Voxel3D) | OK | Shared `DrawVertexColorMesh`; Voxel/Terrain are lit, TileMap unlit; baked colors used |
+| **Skeletal meshes** (skinning) | OK | Engine CPU-skins → repack per frame → same `DrawTrisHelper` path |
+| **Instanced meshes** | OK | One draw per instance, `sceGuSetMatrix`-equivalent per instance |
 | **Particles** | OK | 4→6 vertex expansion per particle, billboard quads |
 | **UI widgets** (Quad / Text / Poly) | OK | gsKit-rendered, font glyph atlas |
-| **Lighting** | OK | 3 directional + ambient, CPU-shaded into per-vertex color |
+| **Lighting** | OK | Ambient + 1 directional + up to 4 point lights, CPU per-vertex, GS overbright HDR |
+| **Materials** | OK | Base-color tint, emissive, vertex-color modulate, two-sided cull |
+| **Blend modes** | OK | Opaque / masked (alpha-test cutout) / translucent / additive; depth-writes off when blended |
+| **Fog** | OK | GS HW distance fog (linear/exp) + horizon-gradient skybox fog |
 | **Audio mixer + streams** | OK | Phase 3 — see [Audio.md](Documentation/Audio.md) |
 | **DualShock 2 input** | OK | libpad both sticks + pressure analog |
 | **Memory card saves** | OK | libmc with icon.sys writer — see [MemoryCard.md](Documentation/MemoryCard.md) |
-| Skeletal meshes (skinning) | Stub | Phase 4 — CPU skinning + repack, no HW bones |
-| Shadow mapping | None | GS can't sample depth as texture |
+| Translucent depth sort | Partial | Depth-writes disabled for blended draws; relies on engine draw order (no per-object back-to-front sort) |
+| Shadow meshes / shadow mapping | None | GS can't sample depth as texture; `GFX_DrawShadowMeshComp` is a stub |
 | Post-processing | None | GS has no spare fillrate; readable framebuffer requires VRAM blit |
 | Light bake / path trace | None | Vulkan-only by design |
 | Network | Stub | Returns "no network"; ps2ip/ps2smap IRX work deferred |
@@ -247,6 +264,40 @@ inject garbage.
   `EmbeddedAssets.cpp`. The EE has only 32 MB main RAM and a cooked-asset
   blob would consume more than half of it. Assets load from host:/cdrom0:/
   mc0:/ at runtime via `AssetManager::Discover`.
+
+## Static Content / Content Pak
+
+Both packaging modes work on PS2 with no addon-side runtime changes. The decode
+lives in shared engine code every target links — `Stream::ReadFile` (covers the
+addon's own `SYS_AcquireFileData`, which sits *below* it) and the
+`SYS_FileOpenRead` / `SYS_FileRead` / `SYS_FileSeek` wrappers in
+`Engine/Source/System/SystemUtils.cpp`, which `System_PS2.cpp` does not
+override. `Runtime/PS2/` never `fopen`s engine content itself; its own `fopen`
+calls are the log file and memory-card/host save fallbacks, which are not
+packaged content.
+
+`ContentPak::Mount` tries the raw path first, then `SYS_GetAbsolutePath` — which
+`System_PS2.cpp` implements to prepend `host:` — so the pak opens under a
+PCSX2 `-elf` boot the same way loose assets do.
+
+**Content Pak is hidden when Embedded is on** (`polyphase.hideContentPak`, set
+in `Ps2_DrawProfileOptions`). This is not cosmetic on PS2: because
+`EmbeddedAssets.cpp` is excluded from the build, an Embedded + Pak build would
+have the engine treat every `.oct` as already compiled into the ELF and delete
+it from the package, leaving nothing to load. Non-Embedded + Static + Pak is the
+supported combination.
+
+Boot log line for a working pak build:
+
+```
+ContentPak: mounted 'Content.pak' (<N> entries)
+```
+
+ISO output caveat: `mkisofs` runs at `-iso-level 1`, so long/nested filenames
+get mangled to 8.3. That already limits disc-boot asset loading regardless of
+these modes (and `SYS_GetPolyphasePath` still returns `host:` unconditionally —
+`cdrom0:` boot is a later phase). `Content.pak` is a single 8.3-safe name at the
+package root, so it is if anything the friendlier layout for a future disc boot.
 
 ## Files of interest
 

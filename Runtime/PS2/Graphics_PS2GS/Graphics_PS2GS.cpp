@@ -945,6 +945,20 @@ namespace
         *p++ = GS_FOGCOL;                                    // register address
     }
 
+    // Toggle GS depth writes via the ZBUF register's ZMSK bit (1 = mask/no write,
+    // 0 = write). Translucent/additive draws set ZMSK=1 so they don't occlude each
+    // other or geometry drawn after them (they still depth-TEST). We rebuild ZBUF
+    // from gsKit's own ZBuffer/PSMZ using its 8 KB-page convention (ZBP =
+    // byteOffset/8192) so the base pointer matches whatever gsKit programmed.
+    inline void WriteZWriteMask(int zmsk)
+    {
+        u64* p = (u64*)gsKit_heap_alloc(sGsGlobal, 1, 16, GIF_AD);
+        *p++ = GIF_TAG_AD(1);
+        *p++ = GIF_AD;
+        *p++ = GS_SETREG_ZBUF(sGsGlobal->ZBuffer / 8192, sGsGlobal->PSMZ, zmsk);
+        *p++ = GS_ZBUF_1 + sGsGlobal->PrimContext;          // 0x4e ctx1 / 0x4f ctx2
+    }
+
     // Fog variant of gsKit_prim_triangle_gouraud_3d (untextured).
     void PrimTriGouraudFog(float x1, float y1, int iz1, int f1,
                            float x2, float y2, int iz2, int f2,
@@ -993,15 +1007,20 @@ namespace
         u64* p_data = (u64*)gsKit_heap_alloc(sGsGlobal, 6, 96, GSKIT_GIF_PRIM_TRIANGLE_TEXTURED);
         *p_data++ = GIF_TAG_TRIANGLE_GORAUD_TEXTURED(0);
         *p_data++ = FogTexGouraudRegs(sGsGlobal->PrimContext);
+        // TCC=1 (use TEXTURE alpha, not just RGB). Required for masked alpha-test
+        // cutout so the texel's per-pixel alpha reaches the alpha test. Harmless for
+        // opaque (alpha is unused when both blend and alpha-test are off) and already
+        // needed by translucent. Was PrimAlphaEnable, which is OFF for masked → the
+        // texel alpha was dropped and cutouts rendered solid.
         if (tex->VramClut == 0)
         {
             *p_data++ = GS_SETREG_TEX0(tex->Vram / 256, tex->TBW, tex->PSM, tw, th,
-                sGsGlobal->PrimAlphaEnable, 0, 0, 0, 0, 0, GS_CLUT_STOREMODE_NOLOAD);
+                1, 0, 0, 0, 0, 0, GS_CLUT_STOREMODE_NOLOAD);
         }
         else
         {
             *p_data++ = GS_SETREG_TEX0(tex->Vram / 256, tex->TBW, tex->PSM, tw, th,
-                sGsGlobal->PrimAlphaEnable, 0, tex->VramClut / 256, tex->ClutPSM,
+                1, 0, tex->VramClut / 256, tex->ClutPSM,
                 tex->ClutStorageMode, 0, GS_CLUT_STOREMODE_LOAD);
         }
         *p_data++ = GS_SETREG_PRIM(GS_PRIM_PRIM_TRIANGLE, 1, 1,
@@ -1059,13 +1078,18 @@ namespace
             vcModulate  = (mat->GetVertexColorMode() != VertexColorMode::None) && hasColor;
         }
         const bool  translucent = (blend == BlendMode::Translucent || blend == BlendMode::Additive);
+        const bool  masked      = (blend == BlendMode::Masked);
         const float opacity     = (translucent && mat != nullptr) ? mat->GetOpacity() : 1.0f;
-        // Alpha byte fed to every vertex. Opaque/Masked → 0xFF (overbright = force
-        // opaque, texel-alpha-immune, kills the cube "lighting flicker"). Translucent/
-        // additive → opacity*128 so the GS blend equation sees As = opacity.
+        // Alpha byte fed to every vertex:
+        //   Translucent/Additive → opacity*128 so the GS blend sees As = opacity.
+        //   Masked → 0x80 (identity) so the fragment alpha == TEXEL alpha and the
+        //     alpha test compares the texel's real alpha against the cutoff (0xFF
+        //     overbright would push every non-zero texel past the cutoff).
+        //   Opaque → 0xFF (overbright = force opaque, texel-alpha-immune; kills the
+        //     cube "lighting flicker").
         const u32 alphaByte = translucent
             ? (u32)glm::clamp((int)(opacity * 128.0f), 0, 255)
-            : 0xFFu;
+            : (masked ? 0x80u : 0xFFu);
 
         // Blend enable (ABE bit in PRIM, read by gsKit AND our fog packets from
         // sGsGlobal->PrimAlphaEnable). Opaque/Masked stay unblended; the GS ALPHA
@@ -1078,6 +1102,22 @@ namespace
                 ? GS_SETREG_ALPHA(0, 2, 0, 1, 0x80)   // Cs*As + Cd
                 : GS_SETREG_ALPHA(0, 1, 0, 1, 0x80);  // (Cs-Cd)*As + Cd
             gsKit_set_primalpha(sGsGlobal, alphaReg, 0);
+            // No depth writes for blended draws (they still depth-TEST against opaque)
+            // — otherwise overlapping/back-to-front translucency self-occludes.
+            WriteZWriteMask(1);
+        }
+        // Masked (alpha-test cutout): discard texels below the mask cutoff so cutout
+        // textures (foliage, chain-link, decals) show holes instead of rendering the
+        // transparent regions solid. gsKit_set_test manages the Z fields, so this
+        // only flips the alpha-test enable — restored to OFF at function end (the UI
+        // font path needs alpha test OFF for antialiased glyph edges).
+        if (masked)
+        {
+            sGsGlobal->Test->ATST  = 5;   // GEQUAL: keep fragment if alpha >= AREF
+            sGsGlobal->Test->AREF  = (u8)glm::clamp(
+                (int)((mat != nullptr ? mat->GetMaskCutoff() : 0.5f) * 255.0f), 0, 255);
+            sGsGlobal->Test->AFAIL = 0;   // KEEP: a failed pixel updates nothing
+            gsKit_set_test(sGsGlobal, GS_ATEST_ON);
         }
 
         // Fog: enable the PRIM FGE bit for this draw (per-vertex F below) and set
@@ -1256,7 +1296,11 @@ namespace
                 const glm::vec2 uv0 = vUV(i0);
                 const glm::vec2 uv1 = vUV(i1);
                 const glm::vec2 uv2 = vUV(i2);
-                if (fog)
+                // Route masked meshes through our custom packet too (even with fog
+                // off): it forces TEX0.TCC=1 so the texel alpha reaches the alpha
+                // test. F is 255 here (no fog) and PrimFogEnable is OFF, so no fog is
+                // applied. gsKit's own textured prim would use its own TEX0/TCC.
+                if (fog || masked)
                 {
                     PrimTriTexGouraudFog(&texSlot->mGsTex,
                         x0, y0, iz0, uv0.x * texW, uv0.y * texH, f0,
@@ -1294,6 +1338,16 @@ namespace
         if (translucent && blend == BlendMode::Additive)
         {
             gsKit_set_primalpha(sGsGlobal, GS_SETREG_ALPHA(0, 1, 0, 1, 0x80), 0);
+        }
+        // Restore depth writes after a blended draw.
+        if (translucent)
+        {
+            WriteZWriteMask(0);
+        }
+        // Restore alpha test OFF (the pipeline default — UI/font AA depends on it).
+        if (masked)
+        {
+            gsKit_set_test(sGsGlobal, GS_ATEST_OFF);
         }
     }
 }
@@ -1566,14 +1620,17 @@ namespace
 
     // Shared draw helper. CPU MVP transform → perspective divide → viewport
     // map → gsKit goraud_texture (textured) or gsKit_prim_triangle_gouraud
-    // (untextured) per triangle. No backface cull, no lighting modulation —
-    // VertexColor already has per-vertex color baked in (engine
-    // pre-shades). Alpha blend ON because tilemap/voxel layers often have
-    // transparent edges. Same Z mapping as static meshes so they Z-test
-    // correctly against lit 3D geometry.
+    // (untextured) per triangle. No backface cull. The per-vertex BAKED color
+    // (VertexColor.mColor) IS the albedo — engine Voxel3D/Terrain3D are Lit +
+    // VertexColorMode::Modulate, so we shade `lighting × vertexColor` per vertex
+    // (matching desktop); TileMap2D is unlit (self-illuminated 2D art) → color
+    // only. Alpha blend ON because tilemap/voxel layers often have transparent
+    // edges. Same Z mapping as static meshes so they Z-test against 3D geometry.
     void DrawVertexColorMesh(const Ps2VertexColorMesh& data,
                               const glm::mat4& model,
-                              Ps2TextureData* texSlot)
+                              Ps2TextureData* texSlot,
+                              const SceneLighting& light,
+                              MaterialLite* mat)
     {
         if (sGsGlobal == nullptr || data.mIndices.empty()) return;
 
@@ -1582,6 +1639,17 @@ namespace
         Camera3D* camera = world->GetActiveCamera();
         if (camera == nullptr) return;
         const glm::mat4 mvp = camera->GetViewProjectionMatrix() * model;
+
+        // Material state — unlit (TileMap) skips Lambert; tint/emissive apply as in
+        // DrawTrisHelper. Voxel/Terrain are Lit so they now respond to the scene's
+        // directional + point lights.
+        const bool unlit       = (mat != nullptr && mat->GetShadingModel() == ShadingModel::Unlit);
+        const glm::vec3 matTint = (mat != nullptr) ? glm::vec3(mat->GetColor()) : glm::vec3(1.0f);
+        const float matEmission = (mat != nullptr) ? mat->GetEmission() : 0.0f;
+        const bool needWP       = (light.mNumPoints > 0) && !unlit;
+
+        glm::mat3 normalMat(model);
+        if (!(normalMat[0][0] == normalMat[0][0])) normalMat = glm::mat3(1.0f);
 
         sGsGlobal->PrimAlphaEnable = GS_SETTING_ON;
         const bool fog = sFog.mEnabled;
@@ -1597,7 +1665,23 @@ namespace
         }
         const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
         const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
-        const u64 kIdentity = GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0);
+
+        // Per-vertex modulation: albedo (baked vertex color) × lighting × tint,
+        // plus emissive. Matches DrawTrisHelper's shade() but with vertex color
+        // as the albedo instead of a flat material.
+        auto shadeVC = [&](const VertexColor& v) -> u64 {
+            const glm::vec3 albedo = UnpackVertexColorRGB(v.mColor);
+            glm::vec3 lit(1.0f);
+            if (!unlit)
+            {
+                const glm::vec3 nWS = glm::normalize(normalMat * v.mNormal);
+                const glm::vec3 wp  = needWP ? glm::vec3(model * glm::vec4(v.mPosition, 1.0f))
+                                             : glm::vec3(0.0f);
+                lit = ComputeLighting(nWS, wp, light);
+            }
+            glm::vec3 modc = matTint * lit * albedo + matTint * matEmission;
+            return PackModColor(modc, 0x80);   // 0x80 alpha = identity (texel alpha verbatim)
+        };
 
         const uint32_t numTris = (uint32_t)data.mIndices.size() / 3;
         for (uint32_t t = 0; t < numTris; ++t)
@@ -1631,6 +1715,10 @@ namespace
             const int f1 = fog ? FogCoefficient(p1.w) : 255;
             const int f2 = fog ? FogCoefficient(p2.w) : 255;
 
+            const u64 c0 = shadeVC(data.mVerts[i0]);
+            const u64 c1 = shadeVC(data.mVerts[i1]);
+            const u64 c2 = shadeVC(data.mVerts[i2]);
+
             if (texSlot != nullptr)
             {
                 const glm::vec2& uv0 = data.mVerts[i0].mTexcoord0;
@@ -1642,7 +1730,7 @@ namespace
                         x0, y0, iz0, uv0.x * texW, uv0.y * texH, f0,
                         x1, y1, iz1, uv1.x * texW, uv1.y * texH, f1,
                         x2, y2, iz2, uv2.x * texW, uv2.y * texH, f2,
-                        kIdentity, kIdentity, kIdentity);
+                        c0, c1, c2);
                 }
                 else
                 {
@@ -1650,20 +1738,20 @@ namespace
                         x0, y0, iz0, uv0.x * texW, uv0.y * texH,
                         x1, y1, iz1, uv1.x * texW, uv1.y * texH,
                         x2, y2, iz2, uv2.x * texW, uv2.y * texH,
-                        kIdentity, kIdentity, kIdentity);
+                        c0, c1, c2);
                 }
             }
             else if (fog)
             {
                 PrimTriGouraudFog(x0, y0, iz0, f0, x1, y1, iz1, f1, x2, y2, iz2, f2,
-                                  kIdentity, kIdentity, kIdentity);
+                                  c0, c1, c2);
             }
             else
             {
                 const int izAvg = (iz0 + iz1 + iz2) / 3;
                 gsKit_prim_triangle_gouraud(sGsGlobal,
                     x0, y0, x1, y1, x2, y2, izAvg,
-                    kIdentity, kIdentity, kIdentity);
+                    c0, c1, c2);
             }
         }
 
@@ -1709,7 +1797,8 @@ void GFX_DrawVoxel3D(Voxel3D* v)
     auto it = sVoxels.find(v);
     if (it == sVoxels.end()) return;
     DrawVertexColorMesh(it->second, v->GetRenderTransform(),
-                        GetVcMeshTexture(v));
+                        GetVcMeshTexture(v), GatherLighting(GetWorld(0)),
+                        ResolveMaterialLite(v));
 }
 
 void GFX_CreateTerrain3DResource(Terrain3D* t)
@@ -1737,7 +1826,8 @@ void GFX_DrawTerrain3D(Terrain3D* t)
     auto it = sTerrains.find(t);
     if (it == sTerrains.end()) return;
     DrawVertexColorMesh(it->second, t->GetRenderTransform(),
-                        GetVcMeshTexture(t));
+                        GetVcMeshTexture(t), GatherLighting(GetWorld(0)),
+                        ResolveMaterialLite(t));
 }
 
 // =========================================================================
@@ -1779,7 +1869,8 @@ void GFX_DrawTileMap2D(TileMap2D* tm)
     auto it = sTileMaps.find(tm);
     if (it == sTileMaps.end()) return;
     DrawVertexColorMesh(it->second, tm->GetRenderTransform(),
-                        GetVcMeshTexture(tm));
+                        GetVcMeshTexture(tm), GatherLighting(GetWorld(0)),
+                        ResolveMaterialLite(tm));
 }
 
 // ----- Particles ----------------------------------------------------------

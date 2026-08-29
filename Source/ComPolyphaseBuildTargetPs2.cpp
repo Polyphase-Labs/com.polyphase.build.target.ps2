@@ -100,6 +100,10 @@ namespace
     constexpr const char* kMakeIsoKey       = "ps2.makeIso";        // "0" = bare ELF only, "1" = also run mkisofs
     constexpr const char* kPcsx2PathKey     = "ps2.pcsx2Path";      // Override PCSX2 binary
 
+    // Engine-side key (Editor/Packaging/BuildProfile.h). Spelled out rather than
+    // included because the addon links against the plugin API headers only.
+    constexpr const char* kHideContentPakKey = "polyphase.hideContentPak";
+
     constexpr const char* kTitleDefault     = "Polyphase Game";
     constexpr const char* kDiscIdDefault    = "POLY0001";          // 8.3-safe; SYSTEM.CNF BOOT2 reference
     constexpr const char* kRegionDefault    = "NTSC";
@@ -599,6 +603,25 @@ namespace
         const std::string discElf  = outDir + "/" + discId + ".ELF";
         const std::string sysCnf   = outDir + "/SYSTEM.CNF";
 
+        // (0) Embedded + Content Pak is unbootable on PS2. The pak sweep treats
+        //     `embedded` as "every .oct is already a byte array in the binary"
+        //     and deletes the loose copies — but Makefile_PS2 excludes
+        //     EmbeddedAssets.cpp, so the ELF has scripts only and the assets are
+        //     simply gone. The hidden Content Pak checkbox
+        //     (polyphase.hideContentPak, set in Ps2_DrawProfileOptions) prevents
+        //     this from the UI; this catches a hand-edited BuildProfiles.json or
+        //     a headless build that never drew the window.
+        if (ctx->embedded != 0 && FileExists(outDir + "/Content.pak"))
+        {
+            const char* msg =
+                "Embedded + Content Pak: the packaged .oct assets were pruned as "
+                "'already in the executable', but PS2 excludes EmbeddedAssets.cpp "
+                "(32 MB EE budget) so they are not in the ELF either. This package "
+                "will boot with no assets. Untick Embedded, or untick Content Pak.";
+            if (ctx->Log) ctx->Log(POLYPHASE_BT_LOG_ERROR, msg);
+            if (ctx->WriteOutputLine) ctx->WriteOutputLine(msg);
+        }
+
         // (1) Rewrite Config.ini in both packaged copies.
         ForcePs2WindowSizeInConfig(outDir + "/Config.ini", region);
         ForcePs2WindowSizeInConfig(outDir + "/" + std::string(ctx->projectName) + "/Config.ini", region);
@@ -742,6 +765,29 @@ namespace
     void Ps2_DrawProfileOptions(const PolyphaseBuildContext* ctx)
     {
         if (ctx == nullptr || ctx->SetProfileSetting == nullptr) return;
+
+        // ----- Hide the Content Pak checkbox -------------------------------
+        // Content Pak only earns its keep on an Embedded build by delivering the
+        // Vulkan .spv files; PS2GS compiles its shaders in, so there is nothing
+        // left for a pak to carry. The engine can't infer that from
+        // basePlatform=Linux (LinuxARM64 and ZIP declare the same and *are*
+        // Vulkan), so non-Vulkan targets opt in explicitly.
+        //
+        // Not merely cosmetic here: Makefile_PS2 deliberately excludes
+        // EmbeddedAssets.cpp (32 MB EE budget), so PS2 "Embedded" means scripts
+        // only and assets still load loose from disc. Embedded + Content Pak
+        // would make the engine treat every .oct as already-in-executable and
+        // delete it from the package — booting to no assets at all. Hiding the
+        // checkbox also force-clears any value saved while it was visible.
+        {
+            char buf[8] = {0};
+            if (ctx->GetProfileSetting == nullptr ||
+                ctx->GetProfileSetting(kHideContentPakKey, buf, sizeof(buf)) == 0 ||
+                buf[0] != '1')
+            {
+                ctx->SetProfileSetting(kHideContentPakKey, "1");
+            }
+        }
 
         // ----- Title -------------------------------------------------------
         {
