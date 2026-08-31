@@ -42,6 +42,7 @@
 #include "Engine/Nodes/3D/Particle3d.h"
 #include "Engine/Nodes/3D/DirectionalLight3d.h"
 #include "Engine/Nodes/3D/PointLight3d.h"
+#include "Engine/Nodes/3D/SpotLight3d.h"
 #include "Engine/Nodes/Widgets/Quad.h"
 #include "Engine/Nodes/Widgets/Text.h"
 #include "Engine/Nodes/Widgets/Poly.h"
@@ -708,6 +709,11 @@ namespace
         glm::vec3 mPos    = glm::vec3(0.0f);
         glm::vec3 mColor  = glm::vec3(0.0f);   // GetColor()*intensity (no colorScale)
         float     mRadius = 0.0f;
+        // Spot cone (SpotLight3D). mCosOuter = -2 marks a plain point light, so the
+        // cone factor stays 1 without a per-vertex branch on light type.
+        glm::vec3 mSpotDir  = glm::vec3(0.0f, 0.0f, -1.0f);
+        float     mCosInner = 1.0f;
+        float     mCosOuter = -2.0f;
     };
 
     // Everything the CPU vertex shader needs for one frame: world ambient, one
@@ -757,6 +763,17 @@ namespace
             p.mPos    = pl->GetWorldPosition();
             p.mColor  = glm::vec3(pl->GetColor()) * pl->GetIntensity();
             p.mRadius = pl->GetRadius();
+
+            if (L->IsSpotLight3D())
+            {
+                SpotLight3D* sl = L->As<SpotLight3D>();
+                const glm::vec3 sd = sl->GetDirection();
+                if (glm::length(sd) > 0.0001f) p.mSpotDir = glm::normalize(sd);
+                const float outer = glm::clamp(sl->GetOuterAngle(), 0.1f, 89.9f);
+                const float inner = glm::clamp(sl->GetInnerAngle(), 0.0f, outer);
+                p.mCosInner = cosf(glm::radians(inner));
+                p.mCosOuter = cosf(glm::radians(outer));
+            }
         }
         return out;
     }
@@ -781,9 +798,18 @@ namespace
             const glm::vec3 toL  = L.mPoints[i].mPos - worldPos;
             const float     dist = glm::length(toL);
             const float     r    = L.mPoints[i].mRadius;
-            const float     atten = (r > 0.0001f) ? glm::clamp(1.0f - dist / r, 0.0f, 1.0f) : 0.0f;
+            float           atten = (r > 0.0001f) ? glm::clamp(1.0f - dist / r, 0.0f, 1.0f) : 0.0f;
             if (atten <= 0.0f) continue;
-            float nl = glm::dot(normalWS, toL / glm::max(dist, 0.0001f));
+            const glm::vec3 toLDir = toL / glm::max(dist, 0.0001f);
+            if (L.mPoints[i].mCosOuter > -1.5f)
+            {
+                // Spot cone: -toLDir points from the light to the vertex.
+                const float coneDot = glm::dot(L.mPoints[i].mSpotDir, -toLDir);
+                const float denom = glm::max(L.mPoints[i].mCosInner - L.mPoints[i].mCosOuter, 0.0001f);
+                atten *= glm::clamp((coneDot - L.mPoints[i].mCosOuter) / denom, 0.0f, 1.0f);
+                if (atten <= 0.0f) continue;
+            }
+            float nl = glm::dot(normalWS, toLDir);
             if (!(nl == nl)) nl = 0.0f;
             col += L.mPoints[i].mColor * (glm::clamp(nl, 0.0f, 1.0f) * atten);
         }
