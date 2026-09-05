@@ -261,7 +261,14 @@ DEFINES = \
 # so PS2 float passes — at the cost of nominal type-safety on those funcs.
 # Same workaround used by every PS2 homebrew that includes GLM.
 
-EE_CFLAGS   = -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES)
+# -MMD -MP: emit a <obj>.d header-dependency file next to every object and
+# pull them all back in (see the -include near the end). Without this, make
+# only compares each .o against its own .cpp, so an engine header edit (a
+# struct gaining a field, a function gaining a defaulted parameter) leaves
+# every other TU stale: "undefined reference to <old signature>" at link
+# time, or objects that link but read a struct with the wrong layout.
+DEPFLAGS = -MMD -MP
+EE_CFLAGS   = -Wall -Wno-unused-parameter -Wno-unused-variable $(DEFINES) $(DEPFLAGS)
 EE_CXXFLAGS = $(EE_CFLAGS) -fno-exceptions -fno-rtti -std=gnu++17
 EE_ASFLAGS  = $(EE_CFLAGS)
 
@@ -313,6 +320,10 @@ all: stage
 # Makefile.pref BEFORE Makefile.eeglobal[_cpp]; we do the same.
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal_cpp
+
+# Header dependencies written by -MMD (see DEPFLAGS). Non-fatal so the first
+# build, before any .d exists, still works.
+-include $(EE_OBJS:.o=.d)
 
 # ---- Stage final ELF for the addon's GetCompiledBinaryPath ------------------
 # Master include builds $(EE_BIN) in $(CURDIR); we copy it to
