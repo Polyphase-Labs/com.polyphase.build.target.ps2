@@ -126,6 +126,40 @@ If it does not come back, the path is the first thing to check — it varies by
 setup (`mc0:`, `mass:`, different folder). `ps2reload -Target osdsys` is the
 escape hatch that depends on nothing.
 
+## ps2deploy — running on the console without ps2link
+
+```powershell
+.\ps2deploy.ps1                 # stage into Build\PS2\Deploy
+.\ps2deploy.ps1 -Dest E:\      # and copy to the card/stick
+```
+
+Strips the ELF (~148 MB of debug info down to ~8 MB loadable) and skips
+`Packages/` (~250 MB of addon *source*, never opened at runtime).
+
+**Copy the CONTENTS to the device ROOT, not a subfolder.** The engine resolves
+assets as `<bootdevice>/<relative path>`, so booting `mmce0:/Game.ELF` makes it
+look for `mmce0:/BuildTarget-PS2/Assets/...`.
+
+### Supported boot devices
+
+| device | notes |
+|---|---|
+| `mmce0:` | SD2PSX / MemCard PRO — the card's **real SD filesystem** |
+| `mass:`  | USB stick |
+| `mc0:`   | a genuine memory card — 8 MB, too small for a full asset tree |
+| `cdrom0:`| disc; needs Content Pak (12-char ISO name collisions) |
+| `host:`  | ps2link, via `ps2run` |
+
+`mmce0:` is the one to use with an SD-based card. It is **not** the same as
+`mc0:` on the same device: `mc0:` is the emulated 8 MB card image, `mmce0:` is
+the SD card itself. The build embeds `mmceman.irx` + `mmcedrv.irx` and loads
+them at boot, so `mmce0:` is registered before any asset load. On a console
+with no MMCE device they find no hardware and boot continues normally.
+
+Logging follows the boot device — `mmce0:/ps2-addon.log`, `mass:/ps2-addon.log`,
+and so on — falling back to `mc0:` on a read-only disc, and to the on-screen
+console if nothing is writable.
+
 ## ps2log
 
 ```powershell

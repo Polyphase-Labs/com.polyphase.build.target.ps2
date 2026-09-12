@@ -106,7 +106,19 @@ namespace
     static Ps2Voice sVoices[AUDIO_MAX_VOICES];
 
     constexpr uint32_t kMaxStreams       = 4;
-    constexpr double   kStreamRingSecs   = 0.5;
+    // 0.5 s was exactly the interval heard repeating while a scene loaded: the
+    // ring simply could not coast long enough. A longer ring lets the stream
+    // survive a blocking load without the SPU2 running dry.
+    // 2 s stereo @44.1 kHz = 352 KB, which the heap can afford now that the
+    // 8 MB gsKit queue reservation is gone.
+    constexpr double   kStreamRingSecs   = 2.0;
+
+    // Stream health counters. Reported once a second rather than logged inline
+    // (logging from audio code is a SIF RPC next to the mixer's own - see
+    // Ps2_SifLock). Guessing at this twice has been wrong; measure it.
+    uint32_t sStreamSubmits   = 0;
+    uint32_t sStreamRejects   = 0;   // ring full: producer outran the mixer
+    uint32_t sStreamUnderruns = 0;   // mixer wanted a frame the producer had not written
 
     struct Ps2Stream
     {
@@ -238,7 +250,11 @@ namespace
 
             for (int f = 0; f < kFramesPerBuffer; ++f)
             {
-                if (s.readFrameInt >= s.writeFrameAbs) break;   // under-run, output silence
+                if (s.readFrameInt >= s.writeFrameAbs)
+                {
+                    ++sStreamUnderruns;
+                    break;   // under-run, output silence
+                }
                 int32_t srcL, srcR;
                 FetchStreamFrame(s, s.ringIdx, srcL, srcR);
                 sMixBuffer[f * 2 + 0] += (srcL * s.leftVolQ15)  >> 15;
@@ -468,6 +484,14 @@ void AUD_Shutdown()
     }
 }
 
+void Ps2_GetStreamStats(uint32_t* submits, uint32_t* rejects, uint32_t* underruns)
+{
+    if (submits   != nullptr) *submits   = sStreamSubmits;
+    if (rejects   != nullptr) *rejects   = sStreamRejects;
+    if (underruns != nullptr) *underruns = sStreamUnderruns;
+    sStreamSubmits = 0; sStreamRejects = 0; sStreamUnderruns = 0;
+}
+
 void AUD_Update()
 {
     // Nothing to do on the main thread — the software mixer runs on its own
@@ -659,9 +683,11 @@ int32_t AUD_SubmitStreamBuffer(uint32_t streamId, const uint8_t* data, uint32_t 
     // because video player uses audio clock as master.
     if (submitFrames > freeFrames)
     {
+        ++sStreamRejects;
         SignalSema(sVoiceLock);
         return 0;
     }
+    ++sStreamSubmits;
 
     const int16_t* srcInt16 = reinterpret_cast<const int16_t*>(data);
     const uint32_t headIdx  = (uint32_t)(s.writeFrameAbs % s.ringFrames);

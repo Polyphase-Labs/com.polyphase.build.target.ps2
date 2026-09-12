@@ -105,6 +105,7 @@ namespace
         uint64_t mVifWaitUs  = 0;   // of mMeshUs: blocked on the previous VIF1 send
         uint32_t mKicks      = 0;   // VU1 batches kicked
         uint32_t mTexUploads = 0;   // textures re-sent to VRAM this frame
+        uint32_t mGsQueuePeak = 0;  // high-water bytes used in gsKit's Oneshot pool
         uint64_t mVcPixels   = 0;   // tilemap/voxel screen-space pixels filled
         // UI draw counts. The 'rest' bucket grows ~3.5 ms over the first few
         // seconds while triangle counts stay flat, so something in the widget
@@ -136,6 +137,8 @@ namespace
 // framebuffer render, and they happen AFTER this frame's timers stop, so
 // they are invisible in WORK and vsync-wait yet still lengthen the frame.
 extern void Ps2_GetLogCost(uint64_t* fileUs, uint64_t* scrUs, uint32_t* lines);
+extern void Ps2_GetIoStats(uint32_t* files, uint64_t* bytes, uint64_t* us);
+extern void Ps2_GetStreamStats(uint32_t* submits, uint32_t* rejects, uint32_t* underruns);
 
 namespace
 {
@@ -228,12 +231,21 @@ namespace
 
     void InitGs()
     {
-        // Use custom queue sizes — gsKit's default Persistent queue is 256 KB
-        // and Oneshot is 1 MB. With ~6000 triangles per frame at ~100 bytes
-        // per gsKit_prim_triangle GIF packet, even Oneshot's 1 MB can fill
-        // up under load. Bump Oneshot to 4 MB so we have headroom for
-        // complex scenes; Persistent stays small since we mostly use Oneshot.
-        constexpr int kOsQueueBytes  = 4 * 1024 * 1024;
+        // gsKit allocates pool[2] for the Oneshot queue (see GSQUEUE::dbuf), so
+        // this figure is paid TWICE out of the EE's 32 MB.
+        //
+        // It used to be 4 MB - i.e. 8 MB of RAM - sized for "~6000 triangles a
+        // frame at ~100 bytes per gsKit_prim_triangle packet". The VU1 work made
+        // that premise obsolete: static meshes, skeletal meshes and the tilemap
+        // all build their own packet2 chains on PATH1 and never touch this queue.
+        // What is left on it is the skybox (~180 tris), UI text (~122 tris) and
+        // particles - tens of KB, not megabytes.
+        //
+        // 8 MB of dead reservation was enough to make a 1 MB texture load fail
+        // with std::bad_alloc while the heap still showed 236 KB free. Back to
+        // gsKit's own default; sStats.mGsQueuePeak tracks headroom so this can be
+        // re-tuned from evidence rather than guesswork.
+        constexpr int kOsQueueBytes  = 1 * 1024 * 1024;
         constexpr int kPerQueueBytes = 256 * 1024;
         sGsGlobal = gsKit_init_global_custom(kOsQueueBytes, kPerQueueBytes);
         if (sGsGlobal == nullptr)
@@ -475,6 +487,16 @@ void GFX_EndFrame()
     // not stall; frame end is where it finally has to happen.
     ps2vu1::FlushBeforeGsKit();
 
+    if (sGsGlobal->Os_Queue != nullptr)
+    {
+        const char* base = (const char*)sGsGlobal->Os_Queue->pool[sGsGlobal->Os_Queue->dbuf];
+        const char* cur  = (const char*)sGsGlobal->Os_Queue->pool_cur;
+        if (cur > base)
+        {
+            const uint32_t used = (uint32_t)(cur - base);
+            if (used > sStats.mGsQueuePeak) sStats.mGsQueuePeak = used;
+        }
+    }
     gsKit_queue_exec(sGsGlobal);
 
     // Work time ends HERE, before the vblank sleep below. Sampling after the
@@ -535,6 +557,8 @@ void GFX_EndFrame()
         sStatsAccum.mSegUs      += sStats.mSegUs;
         sStatsAccum.mVifWaitUs  += ps2vu1::GetVifWaitUs();
         sStatsAccum.mTexUploads += sStats.mTexUploads;
+        if (sStats.mGsQueuePeak > sStatsAccum.mGsQueuePeak)
+            sStatsAccum.mGsQueuePeak = sStats.mGsQueuePeak;
         sStatsAccum.mVcPixels   += sStats.mVcPixels;
         sStatsAccum.mQuads      += sStats.mQuads;
         sStatsAccum.mTexts      += sStats.mTexts;
@@ -565,8 +589,12 @@ void GFX_EndFrame()
             // host: write plus a framebuffer render), all landing in a single
             // frame -- four lines was a ~9 ms hitch once per second, clearly
             // visible on hardware. Keep this a single emit.
+            uint32_t ioFiles = 0; uint64_t ioBytes = 0, ioUs = 0;
+            Ps2_GetIoStats(&ioFiles, &ioBytes, &ioUs);
+            uint32_t asub = 0, arej = 0, aund = 0;
+            Ps2_GetStreamStats(&asub, &arej, &aund);
             LogDebug("[PS2] %s m%d | %u fps | period %llu = WORK %llu (mesh %llu [vif %llu, shade %llu, cull %llu, push %llu, seg %llu] "
-                     "+ tile %llu + rest %llu) + wait %llu + unacct %llu | tris V=%u E=%u C=%u VC=%u | %u kicks | %u texup | UI %llu us (%uq %ut %ug %up) | log %uL %llu us",
+                     "+ tile %llu + rest %llu) + wait %llu + unacct %llu | tris V=%u E=%u C=%u VC=%u | %u kicks | %u texup | aud %us/%ur/%uu | io %uf %lluKB %llums | gsq %uKB | UI %llu us (%uq %ut %ug %up) | log %uL %llu us",
                      sUseVu1Path ? "VU1" : "EE ",
                      sBisectMode,
                      (unsigned)sStatsFrames,
@@ -589,6 +617,10 @@ void GFX_EndFrame()
                      (unsigned)(sStatsAccum.mTrisVC / sStatsFrames),
                      (unsigned)(sStatsAccum.mKicks / sStatsFrames),
                      (unsigned)(sStatsAccum.mTexUploads / sStatsFrames),
+                     asub, arej, aund,
+                     ioFiles, (unsigned long long)(ioBytes / 1024ull),
+                     (unsigned long long)(ioUs / 1000ull),
+                     (unsigned)(sStatsAccum.mGsQueuePeak / 1024u),
                      (unsigned long long)(sStatsAccum.mUiUs   / sStatsFrames),
                      (unsigned)(sStatsAccum.mQuads  / sStatsFrames),
                      (unsigned)(sStatsAccum.mTexts  / sStatsFrames),
@@ -3172,6 +3204,31 @@ void GFX_DrawText(Text* text)
     const uint32_t numVisible = text->GetNumVisibleCharacters();
     if (numVisible == 0) return;
     sStats.mGlyphs += numVisible;
+
+    // What is actually generating ~674 glyphs a frame? The console and stats
+    // overlay are both disabled, so these are real Text widgets. Dump every one
+    // of them a few seconds in, once, with its visible-character count and the
+    // string itself - the string is the part that says whether the count is
+    // honest or whether something is padding it.
+    {
+        static int      sTextDumpFrames = 0;
+        static bool     sTextDumped     = false;
+        static uint64_t sFirstUs        = 0;
+        if (!sTextDumped)
+        {
+            const uint64_t now = SYS_GetTimeMicroseconds();
+            if (sFirstUs == 0) sFirstUs = now;
+            // ~8 s in, by which point the count has plateaued.
+            if (now - sFirstUs > 8000000ull)
+            {
+                if (++sTextDumpFrames > 20) sTextDumped = true;   // one frame's worth
+                const std::string& str = text->GetText();
+                LogDebug("[PS2] TEXT #%d: %u glyphs, strlen=%u, size=%.1f, text='%.40s'",
+                         sTextDumpFrames, (unsigned)numVisible,
+                         (unsigned)str.size(), text->GetTextSize(), str.c_str());
+            }
+        }
+    }
     const uint32_t numVerts = numVisible * TEXT_VERTS_PER_CHAR;
     VertexUI* verts = text->GetVertices();
     if (verts == nullptr) return;

@@ -280,6 +280,48 @@ audsrv_irx.o: audsrv_irx.c
 	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
 EE_OBJS += audsrv_irx.o
 
+# ---- MMCE (SD2PSX / MemCard PRO) --------------------------------------------
+# mmceman exposes the device's REAL SD filesystem as mmce0:, separate from the
+# 8 MB emulated memory card at mc0:. That matters for shipping a build to one:
+# a full asset tree does not fit in an 8 MB card image, but does fit on the SD.
+# mmcedrv adds the faster bulk-transfer path; without it mmceman still works,
+# just slower, so a failure to load it is not fatal.
+# mmceman imports iomanX (the extended I/O manager) and registers through it,
+# NOT through plain ioman. Without iomanX + fileXio the module load fails with
+# -200 and mmce0: never exists, which is exactly what hardware showed.
+IOMANX_IRX_SRC  = $(PS2SDK)/iop/irx/iomanX.irx
+FILEXIO_IRX_SRC = $(PS2SDK)/iop/irx/fileXio.irx
+MMCEMAN_IRX_SRC = $(PS2SDK)/iop/irx/mmceman.irx
+MMCEDRV_IRX_SRC = $(PS2SDK)/iop/irx/mmcedrv.irx
+
+iomanx_irx.c: $(IOMANX_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ iomanx_irx
+iomanx_irx.o: iomanx_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += iomanx_irx.o
+
+filexio_irx.c: $(FILEXIO_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ filexio_irx
+filexio_irx.o: filexio_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += filexio_irx.o
+
+mmceman_irx.c: $(MMCEMAN_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ mmceman_irx
+mmceman_irx.o: mmceman_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += mmceman_irx.o
+
+mmcedrv_irx.c: $(MMCEDRV_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ mmcedrv_irx
+mmcedrv_irx.o: mmcedrv_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += mmcedrv_irx.o
+
 # ---- Flags ------------------------------------------------------------------
 # Variant 2 platform-extension flag plus PS2-native macros. Makefile.eeglobal_cpp
 # will prepend -D_EE -G0 -O2 etc. — do NOT add -G0 ourselves; overriding breaks

@@ -31,6 +31,7 @@
 #include <kernel.h>
 #include <loadfile.h>     // LoadExecPS2 - remote reload
 #include <dirent.h>       // opendir/readdir - list a device when a path fails
+#include <unistd.h>       // sbrk - heap high-water reporting
 #include <timer.h>
 #include <debug.h>          // scr_printf
 #include <delaythread.h>    // DelayThread
@@ -90,6 +91,45 @@ namespace
         SifGuard()  { Ps2_SifLock();   }
         ~SifGuard() { Ps2_SifUnlock(); }
     };
+}
+
+// ---- Heap accounting -------------------------------------------------------
+// The EE has 32 MB and the loadable ELF is ~8.5 MB, so ~23 MB should be free.
+// A 192 KB texture allocation failing means that is not what is happening, and
+// until now the failure was invisible: SYS_AcquireFileData just returned a null
+// buffer and the caller reported "Stream failed to read file".
+uint32_t Ps2_HeapUsedBytes()
+{
+    // sbrk(0) is the current program break: everything below it is the ELF plus
+    // whatever malloc has grown into. Cheap, and it needs no allocator hooks.
+    const uint8_t* brk = (const uint8_t*)sbrk(0);
+    return (uint32_t)(uintptr_t)brk;
+}
+
+// File I/O counters. Deliberately counters and NOT log lines: logging from
+// inside this path issues a SIF RPC next to the one the read itself is making,
+// which corrupted the shared RPC packet pool and crashed in _request_end.
+// Incrementing an integer is safe; the totals are reported once a second from
+// the render thread instead.
+static uint32_t sIoFiles = 0;
+static uint64_t sIoBytes = 0;
+static uint64_t sIoUs    = 0;
+
+void Ps2_GetIoStats(uint32_t* files, uint64_t* bytes, uint64_t* us)
+{
+    if (files != nullptr) *files = sIoFiles;
+    if (bytes != nullptr) *bytes = sIoBytes;
+    if (us    != nullptr) *us    = sIoUs;
+    sIoFiles = 0; sIoBytes = 0; sIoUs = 0;
+}
+
+void Ps2_LogHeap(const char* tag)
+{
+    const uint32_t used = Ps2_HeapUsedBytes();
+    const uint32_t total = 32u * 1024u * 1024u;
+    LogDebug("[PS2] HEAP %s: break at %u KB of %u KB (%u KB left)",
+             tag, used / 1024u, total / 1024u,
+             (total > used) ? (total - used) / 1024u : 0u);
 }
 
 void SYS_Initialize()
@@ -345,6 +385,11 @@ namespace
 {
     char sBootDevice[16] = "host:";   // includes the trailing ':'
     bool sBootIsCdrom    = false;
+    // Does this device want a '/' between the prefix and the path?
+    // host: does NOT (host:Config.ini). mass:, mc0: and mmce0: DO.
+    // Getting this wrong makes every open fail with no error - decided by
+    // probe at boot rather than assumed.
+    bool sBootNeedsSlash = false;
     // Did argv[0] actually name a device, or is "host:" just the fallback?
     // The difference matters: resetting the IOP is only safe when we KNOW we
     // were launched by PCSX2 -elf / ps2link. Guessing wrong destroys a loader's
@@ -380,27 +425,79 @@ bool SYS_PS2_IsBootDeviceKnown() { return sBootDeviceKnown; }
 // whereas the argv[0] parse above must happen before anything opens a file.
 void SYS_PS2_InitBootFilesystem()
 {
-    // If argv[0] never named a device we must not simply assume host: — a
-    // loader-launched disc boot would then look for assets on a filesystem that
-    // does not exist. Spin up CDVD and ask the disc directly: SYSTEM.CNF is
-    // present on every bootable PS2 disc, so opening it proves we are on one.
-    if (!sBootDeviceKnown)
+    // Try one device in both separator forms. Returns true and records the form.
+    auto tryDevice = [](const char* dev) -> bool
     {
-        sceCdInit(CDVD_INIT_INIT);
-        FILE* probe = fopen("cdrom0:\\SYSTEM.CNF;1", "rb");
-        if (probe != nullptr)
+        char path[96];
+        for (int withSlash = 0; withSlash < 2; ++withSlash)
         {
-            fclose(probe);
-            strcpy(sBootDevice, "cdrom0:");
-            sBootIsCdrom = true;
+            snprintf(path, sizeof(path), withSlash ? "%s/Config.ini" : "%sConfig.ini", dev);
+            FILE* f = fopen(path, "rb");
+            scr_printf("[1c]   try %-28s %s\n", path, (f != nullptr) ? "OK" : "-");
+            if (f != nullptr)
+            {
+                fclose(f);
+                // dev may BE sBootDevice when re-probing what argv gave us;
+                // strncpy onto itself is undefined, so skip the copy then.
+                if (dev != sBootDevice)
+                {
+                    strncpy(sBootDevice, dev, sizeof(sBootDevice) - 1);
+                }
+                sBootDevice[sizeof(sBootDevice) - 1] = '\0';
+                sBootNeedsSlash  = (withSlash != 0);
+                sBootIsCdrom     = (strncmp(dev, "cdrom", 5) == 0);
+                sBootDeviceKnown = true;
+                return true;
+            }
         }
+        return false;
+    };
+
+    // Config.ini sits at the root of every packaged build, so finding it proves
+    // the device works AND that the content is actually there.
+    //
+    // argv[0] alone is not enough: it gave the right device here (mmce0:) while
+    // the path SEPARATOR was wrong, and every open failed silently - a black
+    // screen rendering an empty world. Hence probing both forms.
+    if (sBootDeviceKnown && tryDevice(sBootDevice))
+    {
+        scr_printf("[1c] boot device %s confirmed (slash=%d)\n",
+                   sBootDevice, sBootNeedsSlash ? 1 : 0);
         return;
     }
 
-    if (!sBootIsCdrom) return;
-    // cdvdman/cdvdfsv are resident ROM modules; the drive still has to be spun
-    // up and the filesystem mounted before the first open().
+    // mc1: is deliberately absent: probing an EMPTY second card slot blocks for
+    // seconds and looked like a hang on hardware (the trace stopped dead right
+    // after mc0:). Nothing ships to slot 2, so the cost is not worth it.
+    static const char* kCandidates[] = { "mmce0:", "mmce1:", "mass:", "mc0:", "host:" };
+    for (size_t i = 0; i < sizeof(kCandidates) / sizeof(kCandidates[0]); ++i)
+    {
+        if (tryDevice(kCandidates[i]))
+        {
+            scr_printf("[1c] boot device resolved to %s (slash=%d)\n",
+                       sBootDevice, sBootNeedsSlash ? 1 : 0);
+            return;
+        }
+    }
+
+    // cdrom0: LAST and only as a fallback: with no disc in the drive, spinning
+    // up CDVD and opening a path blocks for a long time. That turned the probe
+    // itself into an apparent hang.
     sceCdInit(CDVD_INIT_INIT);
+    FILE* disc = fopen("cdrom0:\\SYSTEM.CNF;1", "rb");
+    if (disc != nullptr)
+    {
+        fclose(disc);
+        strcpy(sBootDevice, "cdrom0:");
+        sBootIsCdrom     = true;
+        sBootNeedsSlash  = false;   // the cdrom path is rebuilt separately
+        sBootDeviceKnown = true;
+        scr_printf("[1c] boot device resolved to cdrom0: (SYSTEM.CNF)\n");
+        return;
+    }
+
+    scr_printf("[1c] NO BOOT DEVICE FOUND - Config.ini not on any device.\n");
+    scr_printf("     Copy the CONTENTS of Build/PS2/Deploy to the device ROOT.\n");
 }
 
 const char* SYS_PS2_GetBootDevice() { return sBootDevice; }
@@ -496,7 +593,8 @@ namespace
         if (!sBootIsCdrom)
         {
             if (hasOurDevice) return path;
-            snprintf(buf, sizeof(buf), "%s%s", sBootDevice, path);
+            snprintf(buf, sizeof(buf), sBootNeedsSlash ? "%s/%s" : "%s%s",
+                     sBootDevice, path);
             return buf;
         }
 
@@ -561,12 +659,27 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
     outSize = 0;
     if (path == nullptr) return;
 
+    // Heap watermark trace: log only when the break has moved by >=256 KB since
+    // the last report, so a 200-asset load yields a readable handful of lines
+    // rather than one per file.
+    {
+        static uint32_t sLastReport = 0;
+        const uint32_t used = Ps2_HeapUsedBytes();
+        if (sLastReport == 0 || (used > sLastReport && used - sLastReport >= 256u * 1024u))
+        {
+            sLastReport = used;
+            Ps2_LogHeap("loading");
+        }
+    }
+
     const char* resolved = WithHostPrefix(path);
     // DO NOT log here. On a ps2link rig a log line is a host: write, i.e. a
     // SIF RPC -- issuing one immediately before this fopen's own RPC, while
     // the audio thread streams over RPC too, corrupts the shared RPC packet
     // pool. It crashed in _request_end (sifrpc.c:318) freeing a null packet,
     // reproducibly, on reaching the streaming audio asset.
+    const uint64_t ioT0 = SYS_GetTimeMicroseconds();
+    ++sIoFiles;
     Ps2_SifLock();
     FILE* f = fopen(resolved, "rb");
     Ps2_SifUnlock();
@@ -626,7 +739,16 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
     // is correct for memalign under newlib.
     const uint32_t allocSize = (actual + 63u) & ~63u;
     outData = (char*)memalign(64, allocSize ? allocSize : 64);
-    if (outData == nullptr) { fclose(f); return; }
+    if (outData == nullptr)
+    {
+        // Was silent. An out-of-memory here surfaced two layers up as
+        // "Stream failed to read file", which reads like an I/O fault and sent
+        // this investigation down the wrong path.
+        LogError("[PS2] OUT OF MEMORY: '%s' needs %ld bytes", resolved, size);
+        Ps2_LogHeap("at failure");
+        Ps2_SifLock(); fclose(f); Ps2_SifUnlock();
+        return;
+    }
 
     // Read in a LOOP. A single fread is not sufficient on cdrom0:: the CDVD
     // driver serves 2048-byte sectors and newlib's glue over cdvdman can return
@@ -665,6 +787,8 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
         if (++guard > 8192) { LogError("[PS2] read loop stuck on '%s'", resolved); break; }
     }
     Ps2_SifLock(); fclose(f); Ps2_SifUnlock();
+    sIoBytes += total;
+    sIoUs    += SYS_GetTimeMicroseconds() - ioT0;
 
     if (total != actual)
     {
@@ -822,7 +946,18 @@ ThreadObject* SYS_CreateThread(ThreadFuncFP func, void* arg)
     t.stack          = stack;
     t.stack_size     = kStackSize;
     t.gp_reg         = &_gp;
-    t.initial_priority = 32;     // mid-priority, same band as standard threads
+    // EE thread priority: LOWER number = HIGHER priority.
+    //   0x30 (48)  audio mixer  - must never be starved, underruns are audible
+    //   0x38 (56)  this band    - background workers (asset loader, audio
+    //                             streaming I/O). Above the game so a blocked
+    //                             worker wakes promptly, below the mixer so it
+    //                             can never preempt audio.
+    //   0x40 (64)  main thread  - the game/render loop
+    //
+    // This was 32, which put every worker ABOVE the mixer. Enabling the audio
+    // streaming thread then made it outrank the mixer it was feeding, and the
+    // music glitched for the duration of each chunk read.
+    t.initial_priority = 0x38;
 
     const int th = CreateThread(&t);
     if (th < 0)
@@ -1473,7 +1608,11 @@ std::string SYS_GetClipboardText() { return ""; }
 // and two concurrent FILE* writes interleave/clobber each other (visible
 // symptom: log lines appear duplicated with mismatched prefixes, then
 // truncate mid-line, then go silent even though the engine keeps running).
-static const char* sLogFilePath = "host:ps2-addon.log";
+// Log destination is chosen at first use from the BOOT DEVICE, not hardcoded.
+// Under ps2link that is host:; booted from USB or the memory card it has to be
+// that device or there is no log at all, and with the on-screen console off
+// (see Main_PS2) a device run would otherwise be completely silent.
+static char sLogFilePath[64] = "host:ps2-addon.log";
 static FILE*       sLogFile     = nullptr;
 
 // Log cost accounting. Every line is a synchronous host: write RPC (a network
@@ -1494,7 +1633,19 @@ static bool     sLogToScreen = true;
 // where a disc build has no host: file to open at all.
 static bool     sLogOpenTried = false;
 
-void Ps2_SetLogToScreen(bool enable) { sLogToScreen = enable; }
+void Ps2_SetLogToScreen(bool enable)
+{
+    // Refuse to turn the screen mirror OFF while there is no log file to write
+    // to. Otherwise a device boot where the log could not be opened (wrong boot
+    // device, read-only media, driver not up) goes completely silent the moment
+    // GFX_Initialize runs - no file, no screen, nothing to debug with.
+    //
+    // The file is opened lazily on the first log line, which happens before
+    // GFX_Initialize, so by the time anything disables this we already know
+    // whether it worked.
+    if (!enable && sLogFile == nullptr) return;
+    sLogToScreen = enable;
+}
 
 void Ps2_GetLogCost(uint64_t* fileUs, uint64_t* scrUs, uint32_t* lines)
 {
@@ -1511,14 +1662,40 @@ void Ps2_AppendLogLineRaw(const char* line)
     if (sLogFile == nullptr && !sLogOpenTried)
     {
         sLogOpenTried = true;
+
+        // Pick the destination now that the boot device is known.
+        const char* dev = SYS_PS2_IsBootDeviceKnown() ? SYS_PS2_GetBootDevice() : "host:";
+        if (strncmp(dev, "cdrom", 5) == 0)
+        {
+            // A disc is read-only. Try the memory card so a disc build still
+            // leaves evidence behind.
+            snprintf(sLogFilePath, sizeof(sLogFilePath), "mc0:/ps2-addon.log");
+        }
+        else if (strncmp(dev, "host:", 5) == 0)
+        {
+            snprintf(sLogFilePath, sizeof(sLogFilePath), "host:ps2-addon.log");
+        }
+        else
+        {
+            snprintf(sLogFilePath, sizeof(sLogFilePath), "%s/ps2-addon.log", dev);
+        }
         // Open with "w" on first use — truncate stale logs from prior runs
         // so a fresh launch doesn't append to a 100 MB file.
         sLogFile = fopen(sLogFilePath, "w");
+        scr_printf("[1b] log -> %s  (%s)\n", sLogFilePath,
+                   (sLogFile != nullptr) ? "open" : "FAILED - screen only");
         if (sLogFile != nullptr)
         {
             // Default newlib stdio uses full buffering; line buffer instead
             // so tailing the file while the game runs shows live progress.
             setvbuf(sLogFile, nullptr, _IOLBF, 0);
+        }
+        else
+        {
+            // Nowhere to write. Fall back to the on-screen console so a device
+            // run is not completely undiagnosable - it costs frame time, but a
+            // silent failure costs more.
+            Ps2_SetLogToScreen(true);
         }
     }
 

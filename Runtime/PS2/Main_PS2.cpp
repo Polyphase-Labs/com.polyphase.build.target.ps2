@@ -28,6 +28,11 @@
 #include <debug.h>           // init_scr / scr_printf — boot-phase tty
 #include <audsrv.h>          // EE-side stubs for the audsrv IOP module
 #include <libmc.h>           // EE-side stubs for mcman/mcserv — memory card
+// fileXioInit declared by hand: including <fileXio_rpc.h> trips ps2sdk newlib's
+// "Using fio/fileXio functions directly ... will lead to problems" #error. We are
+// not doing file I/O through fileXio - we only need to bring the RPC link up so
+// that iomanX-backed devices (mmce0:) are reachable at all.
+extern "C" int fileXioInit(void);
 #include <stdio.h>
 #include <string.h>
 
@@ -40,7 +45,23 @@
 extern "C" unsigned char audsrv_irx[];
 extern "C" unsigned int  size_audsrv_irx;
 
+// Embedded MMCE drivers (SD2PSX / MemCard PRO). mmceman registers mmce0:,
+// which is the device's real SD filesystem - NOT the 8 MB emulated memory
+// card at mc0:. mmcedrv is the faster bulk-transfer path and is optional.
+extern "C" unsigned char iomanx_irx[];
+extern "C" unsigned int  size_iomanx_irx;
+extern "C" unsigned char filexio_irx[];
+extern "C" unsigned int  size_filexio_irx;
+extern "C" unsigned char mmceman_irx[];
+extern "C" unsigned int  size_mmceman_irx;
+extern "C" unsigned char mmcedrv_irx[];
+extern "C" unsigned int  size_mmcedrv_irx;
+
 #include "Engine.h"
+#include "Engine/Renderer.h"   // Renderer::EnableConsole
+extern void Ps2_LogHeap(const char* tag);   // System_PS2.cpp
+#include "Engine/Profiler.h"   // stall attribution
+#include <algorithm>
 #include "EmbeddedFile.h"
 #include "Log.h"
 
@@ -98,6 +119,25 @@ void OctPostInitialize()
     GetEngineState()->mWindowWidth  = 640;
     GetEngineState()->mWindowHeight = 448;
     LogDebug("[PS2] OctPostInitialize: forced viewport 640x448 (NTSC)");
+    Ps2_LogHeap("after engine init");
+
+    // Hide the on-screen log console. Renderer::Initialize only hides it for
+    //   (PLATFORM_WINDOWS || PLATFORM_LINUX || PLATFORM_MAC || PLATFORM_ANDROID) && !_DEBUG
+    // and PS2 is in neither list, so it was left VISIBLE and drawing every log
+    // line the game emits.
+    //
+    // Measured on hardware: four ConsoleOutputText widgets at ~127 glyphs each,
+    // 4.7 ms/frame - more than every 3D triangle in the scene combined, and
+    // larger than the whole tilemap. It is also self-inflating: the per-second
+    // profiler line is itself one of the messages being rendered.
+    //
+    // Re-enable from Lua with Renderer.EnableConsole(true) when you want to read
+    // logs on a console with no ps2link attached.
+    if (Renderer::Get() != nullptr)
+    {
+        Renderer::Get()->EnableConsole(false);
+        LogDebug("[PS2] on-screen console disabled (Renderer.EnableConsole(true) re-enables)");
+    }
 }
 
 // NOTE: the VU1 bring-up test is NOT wired in here. OctPreUpdate/OctPostUpdate
@@ -107,17 +147,95 @@ void OctPostInitialize()
 // away. The test lives in GFX_EndFrame instead — see PS2_VU1_BRINGUP_DEMO in
 // Graphics_PS2GS.cpp.
 void OctPreUpdate()    {}
-void OctPostUpdate()   {}
+// Stall hunter, take three.
+//
+// Take two logged from inside the stalled frame. Each host: log line costs
+// ~2.3 ms, five lines pushed the frame past the 22 ms trigger, which fired
+// another dump on the NEXT frame, and so on - ten "stalls" all reading a
+// near-identical ~49.95 ms that was mostly the logging itself. Only the first
+// sample was real.
+//
+// So: never log from the stalled frame. Remember the worst frame of each
+// one-second window in memory, and emit ONE compact line afterwards.
+namespace
+{
+    struct StallSample
+    {
+        uint64_t mFrameUs = 0;
+        char     mTop[3][32] = {};
+        float    mTopMs[3] = {};
+    };
+
+    StallSample sWorst;
+    uint64_t    sPrevFrameUs  = 0;
+    uint64_t    sWindowStart  = 0;
+    uint64_t    sArmedAtUs    = 0;
+}
+
+void OctPostUpdate()
+{
+    const uint64_t now = SYS_GetTimeMicroseconds();
+    const uint64_t frameUs = (sPrevFrameUs != 0) ? (now - sPrevFrameUs) : 0;
+    sPrevFrameUs = now;
+
+    if (sArmedAtUs == 0) { sArmedAtUs = now; sWindowStart = now; }
+    if (now - sArmedAtUs < 15000000ull) return;      // skip loading
+
+    // Keep the worst frame of this window, with its three costliest phases.
+    if (frameUs > sWorst.mFrameUs)
+    {
+        sWorst.mFrameUs = frameUs;
+        Profiler* prof = GetProfiler();
+        if (prof != nullptr)
+        {
+            const std::vector<CpuStat>& stats = prof->GetCpuFrameStats();
+            for (int slot = 0; slot < 3; ++slot)
+            {
+                const CpuStat* best = nullptr;
+                for (size_t i = 0; i < stats.size(); ++i)
+                {
+                    // Skip ones already taken, and the all-encompassing wrappers.
+                    bool taken = false;
+                    for (int k = 0; k < slot; ++k)
+                        if (strcmp(sWorst.mTop[k], stats[i].mName) == 0) taken = true;
+                    if (taken) continue;
+                    if (best == nullptr || stats[i].mTime > best->mTime) best = &stats[i];
+                }
+                if (best == nullptr) break;
+                strncpy(sWorst.mTop[slot], best->mName, 31);
+                sWorst.mTop[slot][31] = 0;
+                sWorst.mTopMs[slot] = best->mTime;
+            }
+        }
+    }
+
+    // One line a second, emitted from a NORMAL frame, describing the worst.
+    if (now - sWindowStart >= 1000000ull)
+    {
+        sWindowStart = now;
+        if (sWorst.mFrameUs > 20000)
+        {
+            LogDebug("[PS2] worst frame %llu us | %s %.1f | %s %.1f | %s %.1f",
+                     (unsigned long long)sWorst.mFrameUs,
+                     sWorst.mTop[0], sWorst.mTopMs[0],
+                     sWorst.mTop[1], sWorst.mTopMs[1],
+                     sWorst.mTop[2], sWorst.mTopMs[2]);
+        }
+        sWorst = StallSample{};
+    }
+}
+
+// Shutdown hooks - nothing PS2-specific to unwind here; GFX_Shutdown and
+// AUD_Shutdown are driven by the engine.
 void OctPreShutdown()  {}
 void OctPostShutdown() {}
 
-// Boot-device resolution, defined in System_PS2.cpp. Split in two because the
-// argv[0] parse must precede any file open, while the CDVD spin-up must follow
-// the IOP reset and module loading.
-extern void SYS_PS2_InitBootDevice(int argc, char** argv);
-extern void SYS_PS2_InitBootFilesystem();
-extern const char* SYS_PS2_GetBootDevice();
-extern bool SYS_PS2_IsBootDeviceKnown();
+// Boot-device resolution lives in System_PS2.cpp; declared here rather than in
+// a header because these are PS2-target internals, not engine API.
+void        SYS_PS2_InitBootDevice(int argc, char** argv);
+void        SYS_PS2_InitBootFilesystem();
+bool        SYS_PS2_IsBootDeviceKnown();
+const char* SYS_PS2_GetBootDevice();
 
 int main(int argc, char** argv)
 {
@@ -299,6 +417,34 @@ int main(int argc, char** argv)
                            mcmanRet, mcservRet, mcInitRet);
             }
         }
+    }
+
+    // ---- MMCE (SD2PSX / MemCard PRO): register mmce0: -----------------------
+    // ORDER MATTERS. mmceman imports iomanX and registers its device through
+    // it, not through plain ioman. Loading mmceman on its own fails with -200
+    // and mmce0: never appears - confirmed on hardware, and confirmed by the
+    // import table inside mmceman.irx (iomanx, sio2man, dmacman...).
+    //
+    // fileXio is the EE-side bridge to iomanX; without fileXioInit() the EE has
+    // no way to reach devices that iomanX owns.
+    //
+    // All best-effort: a console with no MMCE device simply finds no hardware,
+    // which must not stop boot.
+    {
+        int dummy = 0;
+        const int iomanxRet  = SifExecModuleBuffer(
+            iomanx_irx,  size_iomanx_irx,  0, nullptr, &dummy);
+        const int filexioRet = SifExecModuleBuffer(
+            filexio_irx, size_filexio_irx, 0, nullptr, &dummy);
+        const int mmcemanRet = SifExecModuleBuffer(
+            mmceman_irx, size_mmceman_irx, 0, nullptr, &dummy);
+        const int mmcedrvRet = SifExecModuleBuffer(
+            mmcedrv_irx, size_mmcedrv_irx, 0, nullptr, &dummy);
+
+        const int fxInit = fileXioInit();
+
+        scr_printf("[2c] MMCE: iomanX=%d fileXio=%d mmceman=%d mmcedrv=%d fxInit=%d\n",
+                   iomanxRet, filexioRet, mmcemanRet, mmcedrvRet, fxInit);
     }
 
     // Spin up CDVD if we booted from a disc. Must be after the IOP reset and
