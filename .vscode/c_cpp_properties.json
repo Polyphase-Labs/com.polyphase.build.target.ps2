@@ -15,6 +15,7 @@
                 "M:/Projects/Polyphase/Polyphase/CODE/mergePolyphase/polyphase-engine/External/Imgui",
                 "M:/Projects/Polyphase/Polyphase/CODE/mergePolyphase/polyphase-engine/External/ImGuizmo",
                 "M:/Projects/Polyphase/Polyphase/CODE/mergePolyphase/polyphase-engine/External/Vorbis",
+                "C:/VulkanSDK/1.3.275.0/Include",
                 "${env:VULKAN_SDK}/Include"
             ],
             "defines": [

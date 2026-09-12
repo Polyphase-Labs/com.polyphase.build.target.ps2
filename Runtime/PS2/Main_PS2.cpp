@@ -100,25 +100,88 @@ void OctPostInitialize()
     LogDebug("[PS2] OctPostInitialize: forced viewport 640x448 (NTSC)");
 }
 
+// NOTE: the VU1 bring-up test is NOT wired in here. OctPreUpdate/OctPostUpdate
+// both sit OUTSIDE the render frame (Engine.cpp:2294-2296 calls them either side
+// of Update(), which contains the whole clear->draw->flip sequence), so drawing
+// from either hook lands in a buffer that is about to be cleared or flipped
+// away. The test lives in GFX_EndFrame instead — see PS2_VU1_BRINGUP_DEMO in
+// Graphics_PS2GS.cpp.
 void OctPreUpdate()    {}
 void OctPostUpdate()   {}
 void OctPreShutdown()  {}
 void OctPostShutdown() {}
 
+// Boot-device resolution, defined in System_PS2.cpp. Split in two because the
+// argv[0] parse must precede any file open, while the CDVD spin-up must follow
+// the IOP reset and module loading.
+extern void SYS_PS2_InitBootDevice(int argc, char** argv);
+extern void SYS_PS2_InitBootFilesystem();
+extern const char* SYS_PS2_GetBootDevice();
+extern bool SYS_PS2_IsBootDeviceKnown();
+
 int main(int argc, char** argv)
 {
+    // Work out which device we were launched from BEFORE anything opens a
+    // file. Every subsequent asset/config path is prefixed with the result, so
+    // getting this wrong means every open fails and the game looks empty.
+    // Cheap and side-effect-free except for sceCdInit on a disc boot.
+    SYS_PS2_InitBootDevice(argc, argv);
+
     // ---- Minimal SIF + IOP reset ------------------------------------------
     // SifInitRpc(0) wakes the EE↔IOP RPC bus. Required before any libloadfile
     // / fileXio / smap call. Cheap on PCSX2; ~1 ms on real hardware.
     SifInitRpc(0);
 
-    // Reset and re-init the IOP. Required when running from a host: boot
-    // (PCSX2 -elf) because the IOP is in an unknown state — without these
-    // the next SifLoadFileInit() hangs. On real hardware booting from disc
-    // the BIOS does this for us.
-    while (!SifIopReset("", 0)) {}
-    while (!SifIopSync())       {}
-    SifInitRpc(0);
+    // Reset and re-init the IOP — but ONLY on a host: boot.
+    //
+    // PCSX2 -elf and ps2link drop us in with the IOP in an unknown state, and
+    // without a reset the next SifLoadFileInit() hangs. Booting from any real
+    // device is the opposite case: whoever launched us has already set the IOP
+    // up, and resetting it destroys their work.
+    //
+    // That is fatal under a loader such as OPL, which serves cdrom0: from its
+    // OWN IOP modules — an SMB stack plus an emulated cdvdman. SifIopReset
+    // reboots the IOP from the plain ROM image, so OPL's network and CD
+    // emulation vanish and there is no longer any disc to read. The failure is
+    // silent and total: init_scr() runs AFTER this point, so the screen stays
+    // blank and not a single log line is ever printed.
+    //
+    // The same applies to mass: (USB/BDM), where the reset would unload the
+    // block-device driver we were launched from.
+    // Only reset when argv[0] EXPLICITLY said host:. "host:" is also the
+    // fallback when argv carries no device at all, and a loader that launches
+    // us without argv would otherwise be treated as a PCSX2 -elf boot and have
+    // its IOP wiped — the exact failure this guard exists to prevent.
+    const bool hostBoot = SYS_PS2_IsBootDeviceKnown() &&
+                          (strncmp(SYS_PS2_GetBootDevice(), "host:", 5) == 0);
+
+    // ...and even then, only if host: is not ALREADY serving.
+    //
+    // "host:" covers two very different launchers. Under PCSX2 -elf the device
+    // is emulated by the emulator, so a reset costs nothing. Under ps2link it
+    // is served by ps2link's OWN IOP modules over the network — and resetting
+    // the IOP tears them down, which kills every asset load and the log file
+    // while the game itself carries on running. Observed exactly that on
+    // hardware: the VU1 test cubes drew fine and not one file could be opened.
+    //
+    // argv[0] cannot tell the two apart; both say "host:". So ask the device:
+    // re-open the ELF we were launched from. If that works, host: is live and
+    // must be left alone. If it does not, we are in the state the reset exists
+    // to repair.
+    bool hostAlive = false;
+    if (hostBoot && argc > 0 && argv[0] != nullptr)
+    {
+        FILE* probe = fopen(argv[0], "rb");
+        if (probe != nullptr) { fclose(probe); hostAlive = true; }
+    }
+
+    const bool doIopReset = hostBoot && !hostAlive;
+    if (doIopReset)
+    {
+        while (!SifIopReset("", 0)) {}
+        while (!SifIopSync())       {}
+        SifInitRpc(0);
+    }
 
     // sbv_patches lift the "module must be on protected media" restriction
     // so LoadModuleBuffer from EE RAM works (needed for shipping IRX in
@@ -139,6 +202,11 @@ int main(int argc, char** argv)
     init_scr();
 
     Ps2_BootLog("[1] main() entered");
+    // Print the boot device and whether the IOP was reset as early as the tty
+    // allows — on a loader-launched disc boot these are the two facts that
+    // decide whether anything else can possibly work.
+    scr_printf("[1a] boot device: %s  hostAlive=%d  iopReset=%d\n",
+               SYS_PS2_GetBootDevice(), hostAlive ? 1 : 0, doIopReset ? 1 : 0);
     Ps2_BootLog("[2] SIF + sbv patches applied");
 
     // ---- Load audio IRX stack --------------------------------------------
@@ -232,6 +300,12 @@ int main(int argc, char** argv)
             }
         }
     }
+
+    // Spin up CDVD if we booted from a disc. Must be after the IOP reset and
+    // module loading above — sceCdInit talks to cdvdman over the RPC bus, and
+    // an earlier call would be undone by the reset.
+    SYS_PS2_InitBootFilesystem();
+    scr_printf("[2c] boot device: %s\n", SYS_PS2_GetBootDevice());
 
     Ps2_BootLog("[3] About to call GameMain()");
     GameMain(argc, argv);

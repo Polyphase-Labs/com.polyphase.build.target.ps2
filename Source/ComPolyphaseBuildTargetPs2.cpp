@@ -94,6 +94,8 @@ namespace
     constexpr const char* kRegionKey        = "ps2.region";         // "NTSC" | "PAL"
     constexpr const char* kMakefileKey      = "ps2.makefile";       // bare filename inside addon root, or absolute override
     constexpr const char* kJobsKey          = "ps2.jobs";           // make -j parallelism
+    constexpr const char* kRemoteReloadKey  = "ps2.remoteReload"; // "1" = poll host:reload.cmd and LoadExecPS2 it
+    constexpr const char* kRemoteReloadDefault = "0";            // off: costs nothing, compiles out entirely
     constexpr const char* kUseWslKey        = "ps2.useWsl";         // Windows-only: "0" = native (default), "1" = route through WSL
     constexpr const char* kWslDistroKey     = "ps2.wslDistro";      // Windows-only WSL distro override (honoured when useWsl=1)
     constexpr const char* kPs2DevPathKey    = "ps2.ps2devPath";     // Override $PS2DEV as seen by build shell
@@ -102,7 +104,10 @@ namespace
 
     // Engine-side key (Editor/Packaging/BuildProfile.h). Spelled out rather than
     // included because the addon links against the plugin API headers only.
-    constexpr const char* kHideContentPakKey = "polyphase.hideContentPak";
+    // No longer set by this target: Content Pak is REQUIRED for disc builds
+    // (see the note in the Target Options UI). Kept documented so the key is
+    // discoverable if a future target does need to suppress the checkbox.
+    // constexpr const char* kHideContentPakKey = "polyphase.hideContentPak";
 
     constexpr const char* kTitleDefault     = "Polyphase Game";
     constexpr const char* kDiscIdDefault    = "POLY0001";          // 8.3-safe; SYSTEM.CNF BOOT2 reference
@@ -395,6 +400,14 @@ namespace
         char jobsArg[16];
         std::snprintf(jobsArg, sizeof(jobsArg), " -j%d", jobs);
 
+        // Opt-in runtime features are passed as ADDON_DEFINES, which
+        // Makefile_PS2 already funnels into DEFINES via addprefix -D.
+        std::string addonDefines;
+        if (ReadOption(ctx, kRemoteReloadKey, kRemoteReloadDefault) == "1")
+        {
+            addonDefines += "PS2_REMOTE_RELOAD=1";
+        }
+
         const bool useWsl = UseWsl(ctx);
 
 #if defined(_WIN32)
@@ -452,6 +465,8 @@ namespace
             {
                 cmd += " POLYPHASE_PATH=\"" + std::string(ctx->engineDir) + "\"";
             }
+            if (!addonDefines.empty())
+                cmd += " ADDON_DEFINES=\"" + addonDefines + "\"";
             cmd += jobsArg;
             cmd += "\"";
 
@@ -494,7 +509,9 @@ namespace
             cleanPrefix +
             "make -C " + ShellPath(ctx, intermediateDir) +
             " -f " + ShellPath(ctx, makefilePath) +
-            makeProjectRoot + makePs2Dev + makePolyphasePath + jobsArg;
+            makeProjectRoot + makePs2Dev + makePolyphasePath +
+            (addonDefines.empty() ? std::string()
+                                  : (" ADDON_DEFINES='" + addonDefines + "'")) + jobsArg;
 
         (void)useWsl;
         std::snprintf(outCmd, cap, "%s", WrapShell(ctx, body).c_str());
@@ -566,6 +583,46 @@ namespace
     // psdevwiki: BOOT2 / VER / VMODE keys, CRLF or LF both work, file MUST
     // be uppercase SYSTEM.CNF in the ISO root, and the BOOT2 ELF reference
     // is `cdrom0:\<DISCID>.ELF;1` (backslash, uppercase, `;1` version suffix).
+    // Editor/source files that the packager stages but a PS2 disc must not
+    // carry. With Content Pak on, every runtime asset already lives inside
+    // CONTENT.PAK, so these loose copies are pure dead weight — and worse, the
+    // long ones (SM_CapsuleCylinder.dae, PolyphaseEngineIcons.ttf …) are the
+    // only reason the ISO needs -relaxed-filenames at all.
+    //
+    // .dae/.png/.glb are DCC sources, GLSL shaders cannot run on the GS, and
+    // imgui.ini / *.log are editor and run artefacts.
+    //
+    // `windows` picks cmd.exe quoting over bash quoting; mkisofs -x takes a
+    // path, and -m takes a glob, so globs go through -m.
+    std::string Ps2IsoExcludeFlags(bool windows)
+    {
+        static const char* kGlobs[] = {
+            // DCC sources and shader sources — the cooked .oct is what ships.
+            "*.dae", "*.png", "*.glb", "*.fbx",
+            "*.frag", "*.vert", "*.comp", "*.spv",
+            // Editor / run artefacts.
+            "*.log", "imgui.ini", ".keep",
+            // Addon source trees. The packager stages Packages/ wholesale, which
+            // dragged 251 MB onto the disc — most of it third-party headers and
+            // import libraries (ffmpeg alone). Native addons are compiled INTO
+            // the ELF, so none of this is runtime data. It also nests deeper than
+            // ISO9660 allows (mkisofs: "Directories too deep ... max is 6").
+            "External", "Source", "Build", "Intermediate", ".git",
+            "*.h", "*.hpp", "*.c", "*.cpp", "*.cc", "*.inl",
+            "*.a", "*.lib", "*.dll", "*.so", "*.dylib", "*.exe", "*.pdb", "*.obj",
+            "*.vcxproj", "*.vcxproj.*", "*.sln", "CMakeLists.txt", "Makefile*",
+            "*.md", "*.txt.bak"
+        };
+        const char q = windows ? '"' : '\'';
+        std::string out;
+        for (const char* g : kGlobs)
+        {
+            out += " -m ";
+            out += q; out += g; out += q;
+        }
+        return out;
+    }
+
     bool WriteSystemCnf(const std::string& path, const std::string& discId, const std::string& region)
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -644,12 +701,35 @@ namespace
         // (3) Copy <projectName>.elf to <DISCID>.ELF (uppercase, 8.3-safe).
         //     The bare ELF stays for PCSX2 -elf direct boot; the uppercase
         //     copy is what SYSTEM.CNF references for BIOS / ISO boot.
+        //
+        //     The bare copy is EXCLUDED from the ISO below (-x): shipping both
+        //     put two 155 MB ELFs on a 349 MB disc, and only POLY0001.ELF is
+        //     ever booted.
         if (FileExists(elfPath))
         {
             if (!CopyFileSimple(elfPath, discElf))
             {
                 if (ctx->Log) ctx->Log(POLYPHASE_BT_LOG_ERROR, "Failed to copy ELF to DISCID.ELF");
                 return 0;
+            }
+
+            // Strip the disc copy. The link leaves ~147 MB of DWARF in the ELF
+            // while only ~8 MB is loadable, so an unstripped disc image is
+            // ~18x larger than it needs to be — which on real hardware means
+            // long seeks between the pak and the executable, and a slow load
+            // over SMB or from a burned disc. Debug symbols stay in the bare
+            // ELF next to it for PCSX2 -elf boot and for addr2line.
+            {
+                const std::string strip = Ps2DevAutoDetectPrelude() +
+                    " && mips64r5900el-ps2-elf-strip " + ShellPath(ctx, discElf);
+                const std::string cmd = WrapShell(ctx, strip);
+                if (ctx->WriteOutputLine) ctx->WriteOutputLine(cmd.c_str());
+                if (std::system(cmd.c_str()) != 0 && ctx->Log)
+                {
+                    ctx->Log(POLYPHASE_BT_LOG_WARNING,
+                        "Could not strip the disc ELF; the ISO will be much larger than "
+                        "necessary but is still valid.");
+                }
             }
         }
         else
@@ -683,8 +763,9 @@ namespace
                 std::string sanitizedTitle = title;
                 for (char& c : sanitizedTitle) if (c == '"') c = ' ';
                 std::string cmd = "cmd /C \"cd /D \"" + outDir + "\" && mkisofs -quiet -V \"" +
-                    sanitizedTitle + "\" -sysid \"PLAYSTATION\" -l -iso-level 1 -A \"POLYPHASE\" -o \"" +
-                    isoOut + "\" .\"";
+                    sanitizedTitle + "\" -sysid \"PLAYSTATION\" -l -iso-level 2 -relaxed-filenames -A \"POLYPHASE\""
+                    " -x \"./" + ctx->projectName + ".elf\"" + Ps2IsoExcludeFlags(true) +
+                    " -o \"" + isoOut + "\" .\"";
                 if (ctx->WriteOutputLine) ctx->WriteOutputLine(cmd.c_str());
                 const int rc = std::system(cmd.c_str());
                 if (rc != 0)
@@ -704,8 +785,10 @@ namespace
             // so PS2DEV-bundled mkisofs is found.
             const std::string body = Ps2DevAutoDetectPrelude() + " && cd " + ShellPath(ctx, outDir) +
                 " && mkisofs -quiet -V " + quoteForBash(title) +
-                " -sysid 'PLAYSTATION' -l -iso-level 1 -A 'POLYPHASE' -o " +
-                ShellPath(ctx, isoOut) + " .";
+                " -sysid 'PLAYSTATION' -l -iso-level 2 -relaxed-filenames -A 'POLYPHASE'" +
+                " -x " + quoteForBash(std::string("./") + ctx->projectName + ".elf") +
+                Ps2IsoExcludeFlags(false) +
+                " -o " + ShellPath(ctx, isoOut) + " .";
             const std::string cmd = WrapShell(ctx, body);
             if (ctx->WriteOutputLine) ctx->WriteOutputLine(cmd.c_str());
             const int rc = std::system(cmd.c_str());
@@ -777,17 +860,44 @@ namespace
         // EmbeddedAssets.cpp (32 MB EE budget), so PS2 "Embedded" means scripts
         // only and assets still load loose from disc. Embedded + Content Pak
         // would make the engine treat every .oct as already-in-executable and
-        // delete it from the package — booting to no assets at all. Hiding the
-        // checkbox also force-clears any value saved while it was visible.
+        // delete it from the package — booting to no assets at all.
+        //
+        // HOWEVER: loose files cannot ship on a disc. The PS2's CDVD driver
+        // matches only the first 12 characters of an ISO9660 name (8.3), so any
+        // two assets agreeing in their first 12 chars resolve to whichever sorts
+        // first. Measured on a real ISO: T_DefaultColorAlpha.oct silently loaded
+        // T_DefaultColor.oct's bytes, and SM_Cylinder.oct loaded SM_Cylinder.dae
+        // (7023 bytes instead of 2621). Five such collisions exist among this
+        // project's runtime assets alone. Content Pak is therefore REQUIRED for
+        // cdrom0: distribution — it packs everything into one CONTENT.PAK (11
+        // chars, safely inside 8.3) and removes the loose copies and their names.
+        //
+        // So the option is no longer force-hidden. The engine's own pakRedundant
+        // rule still suppresses it while Embedded is on, which is precisely the
+        // combination that is unsafe; turning Embedded OFF makes the checkbox
+        // available and is the correct configuration for a shipped disc.
+        // See the Content Pak note in the Target Options UI below.
+
+        // ----- Disc-distribution note --------------------------------------
+        ImGui::TextWrapped("Disc / ISO builds: turn OFF Embedded and turn ON "
+                           "Static Content + Content Pak.");
+        if (ImGui::IsItemHovered())
         {
-            char buf[8] = {0};
-            if (ctx->GetProfileSetting == nullptr ||
-                ctx->GetProfileSetting(kHideContentPakKey, buf, sizeof(buf)) == 0 ||
-                buf[0] != '1')
-            {
-                ctx->SetProfileSetting(kHideContentPakKey, "1");
-            }
+            ImGui::SetTooltip(
+                "The PS2 CDVD driver matches only the first 12 characters of an\n"
+                "ISO9660 filename, so loose assets whose names agree in their\n"
+                "first 12 chars silently resolve to whichever sorts first.\n\n"
+                "Measured on a real ISO from this project:\n"
+                "  T_DefaultColorAlpha.oct  ->  loaded T_DefaultColor.oct\n"
+                "  SM_Cylinder.oct          ->  loaded SM_Cylinder.dae\n\n"
+                "Content Pak folds everything into a single CONTENT.PAK (11\n"
+                "chars, safely inside 8.3) and drops the loose copies, which is\n"
+                "the only reliable way to ship assets on cdrom0:.\n\n"
+                "Embedded must be OFF: PS2 excludes EmbeddedAssets.cpp for the\n"
+                "32 MB EE budget, so Embedded + Content Pak would strip the .oct\n"
+                "files from the package and boot with no assets at all.");
         }
+        ImGui::Separator();
 
         // ----- Title -------------------------------------------------------
         {
@@ -828,6 +938,24 @@ namespace
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Selects SYSTEM.CNF VMODE and the packaged Config.ini WindowHeight (NTSC: 640x448, PAL: 640x512).");
         }
+
+        // ----- Remote reload ------------------------------------------------
+        {
+            std::string current = ReadOption(ctx, kRemoteReloadKey, kRemoteReloadDefault);
+            bool remote = (current == "1");
+            if (ImGui::Checkbox("Remote Reload", &remote))
+            {
+                ctx->SetProfileSetting(kRemoteReloadKey, remote ? "1" : "0");
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Off (default): compiled out entirely, costs nothing.\n"
+                    "On: once a second the game checks for 'reload.cmd' next to the ELF on "
+                    "the host, and if it exists hands the EE to the ELF path named inside it "
+                    "(empty file = host:reboot.elf). Lets you launch a new build from the PC "
+                    "without reaching the console's reset button.\n\n"
+                    "Needs a live host: filesystem, i.e. a ps2link rig. Costs one host: fopen "
+                    "per second (~1.7 ms) while enabled, so leave it off for timing runs.");        }
 
         // ----- Make ISO ----------------------------------------------------
         {

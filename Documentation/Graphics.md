@@ -189,9 +189,43 @@ pressure forces eviction.
   `VertexBasic`, draw through the static-mesh path.
 - **Texture swizzling** — GS prefers tile-swizzled textures for fastest
   sampling. Cook-time swizzle pass would speed up texture-heavy scenes.
-- **VU1 microcode draw path** — bypass gsKit's EE-side packet emit and
-  upload static-mesh vertex data once to VU1 microcode. Substantial
-  perf win for static geometry, but a major surgery.
+- **Texture upload via VIF1 DIRECT** — TEX0 currently goes through gsKit's
+  queue, which forces a DMA barrier whenever a textured mesh is drawn.
+  Emitting it inside the VU1 chain instead would make those barriers free.
+- **Display lists for static meshes** — `xtcpBuildList` compiles a mesh into a
+  reusable DMA chain, so static geometry stops being re-walked every frame.
+  The remaining EE-side win lives here.
+
+## VU1 geometry path (implemented)
+
+Static, skeletal, instanced and text meshes are transformed, clipped and
+kicked by **VU1** rather than by the EE. The microcode is vendored from XTC
+(`Runtime/PS2/Graphics_PS2GS/vu1/`, MIT — see `THIRD_PARTY_NOTICES.md`) and
+driven from `PS2VU1Pipe.cpp` via ps2sdk's `packet2`.
+
+Measured on real PS2 hardware (ps2link), ~2,600-triangle scene:
+
+| Path | fps | EE work | vsync wait | tris to GS |
+|---|---|---|---|---|
+| EE  | 31 | 13,450 us | 15,100 us | 2,584 |
+| VU1 | **59** | 12,766 us | **951 us** | 1,330 (1,073 culled) |
+
+The win is **not** EE time — that barely moved. It is GS fill: VU1 culls back
+faces (which XTC's microcode does not do, so it is done in object space on the
+EE) and batches ~24 triangles per GIF packet instead of one ~100-byte packet
+per triangle. Read the `vsync-wait` column, not `WORK`, when tuning this.
+
+Lighting deliberately stays on the EE: the `im3d` microprogram takes a finished
+vertex colour, so ambient, directional, point and spot lights all keep working
+unchanged — and each vertex is now lit once instead of once per triangle corner.
+
+Fog, skybox and translucent meshes still fall back to the EE path (~180 tris
+here). Toggle the whole path with `sUseVu1Path` in `Graphics_PS2GS.cpp`;
+`PS2_VU1_AB_MEASURE` alternates the two paths every second for on-hardware A/B.
+
+**Do not benchmark this in PCSX2.** It reported VU1 2% *faster* where hardware
+showed 25% *slower* (before culling existed) — it models neither DMA latency
+nor GS fill. Use it for correctness only; take timings from hardware.
 
 ## References
 

@@ -118,7 +118,10 @@ void INP_Shutdown()
     InputShutdown();
 }
 
-void INP_Update()
+// Measured at ~35 us/frame on hardware, so libpad's vblank-synchronised SIO2
+// transfer is NOT a source of frame-time jitter here — worth recording, because
+// it is the obvious suspect for a stall outside the renderer's timing window.
+static void INP_UpdateImpl()
 {
     InputAdvanceFrame();
 
@@ -202,6 +205,13 @@ void INP_Update()
 
     InputPostUpdate();
 }
+
+void INP_Update()
+{
+    INP_UpdateImpl();
+}
+
+
 
 // PS2 doesn't surface cursor / mouse / soft-keyboard concepts the engine knows
 // about. Symbols required for link.

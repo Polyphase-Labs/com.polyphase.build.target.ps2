@@ -49,6 +49,12 @@
 #include "Log.h"
 
 #include <kernel.h>
+
+// Shared with the host: file path -- see Ps2_SifLockInit in System_PS2.cpp.
+// audsrv calls are SIF RPCs and this thread issues ~500/s while the main
+// thread is loading assets over RPC too.
+extern void Ps2_SifLock();
+extern void Ps2_SifUnlock();
 #include <audsrv.h>
 #include <unistd.h>     // usleep — PS2SDK newlib provides this
 
@@ -306,12 +312,16 @@ namespace
             // ~1 buffer/s → SPU2 drained its ring, STOPPED (no auto-restart), and
             // audio crawled. audsrv_available() reads the ring heads live, so we
             // top the ring up at the true SPU2 drain rate and it never underruns.
+            Ps2_SifLock();
             int avail  = audsrv_available();
+            Ps2_SifUnlock();
             int filled = 0;
             while (avail >= kBytesPerBuffer && filled < kMaxFillPerWait)
             {
                 MixOneBuffer();
+                Ps2_SifLock();
                 audsrv_play_audio(reinterpret_cast<char*>(sOutBuffer), kBytesPerBuffer);
+                Ps2_SifUnlock();
                 avail -= kBytesPerBuffer;
                 ++filled;
             }

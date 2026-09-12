@@ -29,11 +29,14 @@
 #include "Utilities.h"
 
 #include <kernel.h>
+#include <loadfile.h>     // LoadExecPS2 - remote reload
+#include <dirent.h>       // opendir/readdir - list a device when a path fails
 #include <timer.h>
 #include <debug.h>          // scr_printf
 #include <delaythread.h>    // DelayThread
 #include <unistd.h>         // rmdir, etc.
 #include <libmc.h>          // mcOpen/mcRead/mcWrite/mcSync — memory card I/O
+#include <libcdvd.h>        // sceCdInit — required before any cdrom0: file open
 #include <fcntl.h>          // O_RDONLY / O_WRONLY / O_CREAT / O_TRUNC for mcOpen modes
 
 #include <stdio.h>
@@ -50,8 +53,48 @@ static bool sInitialized = false;
 // Lifecycle
 // =========================================================================
 
+// ---- EE-side SIF RPC serialisation ---------------------------------------
+// The audio mixer runs on its OWN EE thread and polls audsrv_available() every
+// 2 ms -- ~500 SIF RPCs a second, from boot, forever. The main thread loads
+// every asset over host:, which is also SIF RPC (ps2link fileio). ps2sdk's RPC
+// packet pool is shared between all EE callers and is NOT guarded, so two
+// threads issuing RPCs concurrently can hand the same packet to
+// rpc_packet_free twice.
+//
+// Observed: three intermittent load stalls at three different points (no error,
+// no crash, just stops), and -- once logging added a third RPC into the file
+// path -- a hard crash in _request_end (sifrpc.c:318) with BadVAddr 0x00000010,
+// a null packet dereference.
+//
+// This serialises the two subsystems we control. Granularity is per stdio call,
+// not per file, so a multi-megabyte asset read cannot starve the mixer.
+static int sSifSema = -1;
+
+void Ps2_SifLockInit()
+{
+    if (sSifSema >= 0) return;
+    ee_sema_t s = {};
+    s.init_count = 1;
+    s.max_count  = 1;
+    sSifSema = CreateSema(&s);
+    if (sSifSema < 0) LogError("Ps2_SifLockInit: CreateSema failed (%d)", sSifSema);
+}
+void Ps2_SifLock()   { if (sSifSema >= 0) WaitSema(sSifSema); }
+void Ps2_SifUnlock() { if (sSifSema >= 0) SignalSema(sSifSema); }
+
+namespace
+{
+    // Scoped form for the file helpers below.
+    struct SifGuard
+    {
+        SifGuard()  { Ps2_SifLock();   }
+        ~SifGuard() { Ps2_SifUnlock(); }
+    };
+}
+
 void SYS_Initialize()
 {
+    Ps2_SifLockInit();   // before ANY host: I/O or audio RPC
     if (sInitialized) return;
     sInitialized = true;
     LogDebug("System_PS2: initialised (EE @ 294MHz, IOP @ 33MHz, GS w/ 4 MB VRAM)");
@@ -62,40 +105,335 @@ void SYS_Shutdown()
     sInitialized = false;
 }
 
+#ifndef PS2_REMOTE_RELOAD
+#define PS2_REMOTE_RELOAD 0
+#endif
+
+#if PS2_REMOTE_RELOAD
+// ---- Remote reload -------------------------------------------------------
+// Watch for a marker file over host: once a second. When it appears, hand the
+// EE to whatever ELF path the file names -- so a new build can be launched from
+// the PC without walking over to the console and hitting reset.
+//
+// reload.cmd is a TEXT file holding a path; it is the trigger, not the payload.
+// The scripts keep it permanently present holding "none", and this poll disarms
+// by writing "none" back rather than deleting it -- see the note below on what
+// happens when a host: open finds nothing there.
+//
+// No purpose-built "reboot.elf" is needed. Useful targets:
+//   host:BuildTarget-PS2.elf        relaunch the freshly built game (hot reload)
+//   mc0:/ps2link_1.2/PS2LINK.ELF   back to ps2link, then execee as usual
+//   mc0:/SYS_OSDMENU/osdmenu.elf    the FreeMcBoot OSD menu
+//   rom0:OSDSYS                     bare BIOS browser; last resort, the one
+//                                   target needing no filesystem at all
+//
+// This is NOT a ps2link server. The game has no TCP stack of its own
+// (Network_PS2 is a stub, smap is never loaded), so it cannot accept an
+// `execee` the way ps2link.elf does. What it does have is a working host:
+// filesystem, courtesy of the ps2link IOP modules that stay resident while the
+// game runs -- so a file IS the message.
+//
+// Costs one host: fopen per second (~1.7 ms on a ps2link rig) and compiles to
+// nothing at all unless the 'Remote Reload' Target Option is checked.
+void AUD_Shutdown();   // Audio_PS2.cpp (C++ linkage)
+
+static void Ps2_PollRemoteReload()
+{
+    static const char* kMarker = "host:reload.cmd";
+
+    static uint64_t sNextCheckUs = 0;
+    const uint64_t now = SYS_GetTimeMicroseconds();
+    if (now < sNextCheckUs) return;
+    sNextCheckUs = now + 1000000ull;
+
+    char path[256];
+    path[0] = '\0';
+    bool found = false;
+
+    Ps2_SifLock();
+    FILE* f = fopen(kMarker, "rb");
+    if (f != nullptr)
+    {
+        found = true;
+        const size_t n = fread(path, 1, sizeof(path) - 1, f);
+        path[n] = '\0';
+        fclose(f);
+    }
+    Ps2_SifUnlock();
+
+    // One-shot diagnostics. Without these a failed open is indistinguishable
+    // from "no reload requested", and the feature looks dead for either reason.
+    static bool sReportedOk   = false;
+    static bool sReportedFail = false;
+    if (found && !sReportedOk)
+    {
+        sReportedOk = true;
+        LogDebug("[PS2] remote reload: polling '%s' OK (%u bytes)",
+                 kMarker, (unsigned)strlen(path));
+    }
+    else if (!found && !sReportedFail)
+    {
+        sReportedFail = true;
+        LogWarning("[PS2] remote reload: cannot open '%s'. The marker must exist "
+                   "and be a FILE in the directory ps2client was launched from "
+                   "(run Tools/ps2run, which creates it).", kMarker);
+    }
+
+    if (!found) return;
+
+    // Trim trailing whitespace a PC-side editor will have added.
+    size_t len = strlen(path);
+    while (len > 0 && (path[len - 1] == '\n' || path[len - 1] == '\r' ||
+                       path[len - 1] == ' '  || path[len - 1] == '\t'))
+    {
+        path[--len] = '\0';
+    }
+
+    // "none" (what the scripts leave behind) and empty both mean "nothing to do".
+    // Empty deliberately does NOT default to a reboot target any more: an empty
+    // or unreadable marker is an ambiguous signal, and guessing wrong throws the
+    // user out to the BIOS mid-session.
+    if (len == 0 || strcmp(path, "none") == 0) return;
+
+    const char* target = path;
+    LogDebug("[PS2] remote reload requested -> '%s'", target);
+
+    // Disarm by REWRITING the marker, never by deleting it. This poll must never
+    // leave the file missing: opening a nonexistent path over ps2link's host:
+    // creates a DIRECTORY of that name, which then blocks every future write
+    // (the PC-side script gets "access denied") and blocks its own open, so the
+    // feature silently disables itself. Observed exactly that.
+    Ps2_SifLock();
+    FILE* w = fopen(kMarker, "wb");
+    if (w != nullptr)
+    {
+        fwrite("none", 1, 4, w);
+        fclose(w);
+    }
+    Ps2_SifUnlock();
+    if (w == nullptr)
+    {
+        LogWarning("[PS2] remote reload: could not disarm '%s' - the next run "
+                   "will trigger again immediately", kMarker);
+    }
+
+    // Pre-flight the target. LoadExecPS2 is declared __attribute__((noreturn)),
+    // so any error handling written AFTER it is dead code the compiler removes -
+    // there is no way to report a bad path once the call is made. A typo would
+    // simply take the console somewhere unrecoverable with nothing in the log.
+    // So prove the file opens FIRST. rom0: is skipped: it is a BIOS device, not
+    // a filesystem newlib can open, and it always exists.
+    if (strncmp(target, "rom0:", 5) != 0)
+    {
+        Ps2_SifLock();
+        FILE* probe = fopen(target, "rb");
+        if (probe != nullptr) fclose(probe);
+        Ps2_SifUnlock();
+        if (probe == nullptr)
+        {
+            LogError("[PS2] remote reload: '%s' cannot be opened - NOT exec'ing it.", target);
+
+            // Guessing at the right path has cost several round trips, so list
+            // what is actually on the device instead. POSIX opendir, not fio* --
+            // ps2sdk's newlib port #errors on direct fio/fileXio use.
+            // Prefer listing the target's PARENT directory: that names the ELF
+            // we actually wanted. Fall back to the device root when the parent
+            // does not exist either.
+            char dev[256];
+            size_t n = strlen(target);
+            while (n > 0 && target[n - 1] != '/') --n;   // strip the filename
+            if (n > 0 && n < sizeof(dev))
+            {
+                memcpy(dev, target, n);
+                dev[n] = '\0';
+            }
+            else
+            {
+                dev[0] = '\0';
+            }
+
+            Ps2_SifLock();
+            DIR* probeDir = (dev[0] != '\0') ? opendir(dev) : nullptr;
+            if (probeDir != nullptr) closedir(probeDir);
+            Ps2_SifUnlock();
+
+            if (probeDir == nullptr)
+            {
+                size_t d = 0;
+                while (d < sizeof(dev) - 3 && target[d] != '\0' && target[d] != ':')
+                {
+                    dev[d] = target[d];
+                    ++d;
+                }
+                dev[d++] = ':';
+                dev[d++] = '/';
+                dev[d]   = '\0';
+            }
+
+            Ps2_SifLock();
+            DIR* dir = opendir(dev);
+            Ps2_SifUnlock();
+            if (dir == nullptr)
+            {
+                LogError("[PS2] remote reload: cannot list '%s' either - is that "
+                         "device mounted? 'rom0:OSDSYS' always works.", dev);
+            }
+            else
+            {
+                LogDebug("[PS2] remote reload: contents of '%s':", dev);
+                int shown = 0;
+                for (;;)
+                {
+                    Ps2_SifLock();
+                    struct dirent* ent = readdir(dir);
+                    Ps2_SifUnlock();
+                    if (ent == nullptr) break;
+                    if (shown >= 200) { LogDebug("[PS2]     ... (truncated)"); break; }
+                    if (ent->d_name[0] == '.') continue;   // . and ..
+                    LogDebug("[PS2]     %s", ent->d_name);
+                    ++shown;
+                }
+                Ps2_SifLock();
+                closedir(dir);
+                Ps2_SifUnlock();
+            }
+            return;
+        }
+    }
+
+    // Stop the audio mixer before handing over. It is a separate EE thread
+    // issuing SIF RPCs ~500x/s; leaving it running across LoadExecPS2 is asking
+    // for a half-finished RPC to land in the next program's lap.
+    AUD_Shutdown();
+    // Nothing after this line runs: LoadExecPS2 is noreturn. Failure has to be
+    // caught by the pre-flight open above, not reported here.
+    LoadExecPS2(target, 0, nullptr);
+}
+#endif // PS2_REMOTE_RELOAD
+
 void SYS_Update()
 {
     // PS2 has no per-frame callback drain analogue to PSP's sceKernelCheckCallback.
     // The EE kernel handles interrupts asynchronously; nothing to do here.
+#if PS2_REMOTE_RELOAD
+    Ps2_PollRemoteReload();
+#endif
 }
 
 // =========================================================================
 // Paths
 // =========================================================================
 
+// =========================================================================
+// Boot device resolution
+//
+// PS2SDK's newlib has NO default device: fopen("Config.ini") fails because
+// nothing knows whether that means host:, cdrom0:, mass: or mc0:. Which one is
+// correct depends entirely on how the ELF was launched, so it is discovered at
+// startup from argv[0] — every PS2 loader passes the full boot path there:
+//
+//   PCSX2 -elf / ps2link : "host:...\BuildTarget-PS2.elf"  -> host:
+//   Disc or ISO          : "cdrom0:\POLY0001.ELF;1"        -> cdrom0:
+//   USB / SD via BDM     : "mass:/games/game.elf"          -> mass:
+//
+// Before this existed the prefix was hardcoded to "host:", which works only
+// under PCSX2 and ps2link — so a burned disc or an SD-card boot would launch
+// fine and then fail every single asset open, which looks exactly like an
+// empty game.
+// =========================================================================
+namespace
+{
+    char sBootDevice[16] = "host:";   // includes the trailing ':'
+    bool sBootIsCdrom    = false;
+    // Did argv[0] actually name a device, or is "host:" just the fallback?
+    // The difference matters: resetting the IOP is only safe when we KNOW we
+    // were launched by PCSX2 -elf / ps2link. Guessing wrong destroys a loader's
+    // IOP modules and the console dies before it can print anything.
+    bool sBootDeviceKnown = false;
+}
+
+void SYS_PS2_InitBootDevice(int argc, char** argv)
+{
+    if (argc > 0 && argv != nullptr && argv[0] != nullptr)
+    {
+        const char* a = argv[0];
+        const char* colon = strchr(a, ':');
+        // Guard the length so a path like "host:M:\..." takes the FIRST colon
+        // (the device) and never the drive letter further along.
+        if (colon != nullptr && (colon - a) > 0 && (colon - a) < (int)sizeof(sBootDevice) - 1)
+        {
+            const size_t n = (size_t)(colon - a) + 1;
+            memcpy(sBootDevice, a, n);
+            sBootDevice[n] = '\0';
+            sBootDeviceKnown = true;
+        }
+    }
+
+    sBootIsCdrom = (strncmp(sBootDevice, "cdrom", 5) == 0);
+}
+
+bool SYS_PS2_IsBootDeviceKnown() { return sBootDeviceKnown; }
+
+// Second half of boot-device setup, split out because sceCdInit talks to
+// cdvdman over the EE<->IOP RPC bus: it must run AFTER SifInitRpc and after the
+// IOP reset (which would otherwise tear down the module we just initialised),
+// whereas the argv[0] parse above must happen before anything opens a file.
+void SYS_PS2_InitBootFilesystem()
+{
+    // If argv[0] never named a device we must not simply assume host: — a
+    // loader-launched disc boot would then look for assets on a filesystem that
+    // does not exist. Spin up CDVD and ask the disc directly: SYSTEM.CNF is
+    // present on every bootable PS2 disc, so opening it proves we are on one.
+    if (!sBootDeviceKnown)
+    {
+        sceCdInit(CDVD_INIT_INIT);
+        FILE* probe = fopen("cdrom0:\\SYSTEM.CNF;1", "rb");
+        if (probe != nullptr)
+        {
+            fclose(probe);
+            strcpy(sBootDevice, "cdrom0:");
+            sBootIsCdrom = true;
+        }
+        return;
+    }
+
+    if (!sBootIsCdrom) return;
+    // cdvdman/cdvdfsv are resident ROM modules; the drive still has to be spun
+    // up and the filesystem mounted before the first open().
+    sceCdInit(CDVD_INIT_INIT);
+}
+
+const char* SYS_PS2_GetBootDevice() { return sBootDevice; }
+
 std::string SYS_GetExecutablePath()
 {
-    // No introspection API for "where did this ELF come from". Return a
-    // conventional path; engine consumers only need this for debug logs.
-    return "host:polyphase.elf";
+    // No introspection API for "where did this ELF come from" beyond argv[0],
+    // which SYS_PS2_InitBootDevice already reduced to a device prefix. Engine
+    // consumers only use this for debug logs.
+    return std::string(sBootDevice) + "polyphase.elf";
 }
 
 std::string SYS_GetPolyphasePath()
 {
-    return "host:";
+    return sBootDevice;
 }
 
 std::string SYS_GetCurrentDirectoryPath()
 {
-    return "host:";
+    return sBootDevice;
 }
+
+// Defined further down, next to the rest of the path plumbing.
+namespace { const char* WithHostPrefix(const char* path); }
 
 std::string SYS_GetAbsolutePath(const std::string& relativePath)
 {
-    if (relativePath.size() >= 5 && relativePath.compare(0, 5, "host:") == 0) return relativePath;
-    if (relativePath.size() >= 7 && relativePath.compare(0, 7, "cdrom0:") == 0) return relativePath;
-    if (relativePath.size() >= 4 && relativePath.compare(0, 4, "mc0:") == 0) return relativePath;
-    if (relativePath.size() >= 4 && relativePath.compare(0, 4, "mc1:") == 0) return relativePath;
-    return SYS_GetPolyphasePath() + relativePath;
+    // Engine code calls this and then fopen()s the result DIRECTLY, without
+    // going through SYS_DoesFileExist / SYS_ReadFile — so the normalisation has
+    // to happen here too, not just in the fopen wrappers. Returning a bare
+    // "cdrom0:" + "BuildTarget-PS2/Content.pak" produced a lowercase,
+    // forward-slashed, un-versioned path that the CDVD driver cannot open.
+    return WithHostPrefix(relativePath.c_str());
 }
 
 void SYS_ExplorerOpenDirectory(const std::string& /*dirPath*/) {}
@@ -146,9 +484,63 @@ namespace
     const char* WithHostPrefix(const char* path)
     {
         if (path == nullptr) return nullptr;
-        if (HasDevicePrefix(path)) return path;
         static char buf[512];
-        snprintf(buf, sizeof(buf), "host:%s", path);
+
+        const int  devLen = (int)strlen(sBootDevice);
+        const bool hasOurDevice = (strncmp(path, sBootDevice, (size_t)devLen) == 0);
+
+        // A path carrying some OTHER device (mc0:, rom0:, host: while booted
+        // from disc) is deliberate — leave it exactly as the caller wrote it.
+        if (!hasOurDevice && HasDevicePrefix(path)) return path;
+
+        if (!sBootIsCdrom)
+        {
+            if (hasOurDevice) return path;
+            snprintf(buf, sizeof(buf), "%s%s", sBootDevice, path);
+            return buf;
+        }
+
+        // IMPORTANT: paths that ALREADY carry our own device still have to be
+        // normalised. The engine composes some of them itself as
+        // SYS_GetPolyphasePath() + relative, producing e.g.
+        //     "cdrom0:BuildTarget-PS2/Content.pak"
+        // and cdvdman silently drops the forward slashes, so the open turns
+        // into "BuildTarget-PS2Content.pak" and fails. Strip our prefix back
+        // off and rebuild the path properly rather than passing it through.
+        const char* rel = hasOurDevice ? path + devLen : path;
+        while (*rel == '/' || *rel == '\\') ++rel;
+
+        // ISO9660 needs three transformations the other devices don't:
+        //   * backslash separators
+        //   * UPPERCASE (mkisofs uppercases every name; a lowercase lookup
+        //     simply will not match)
+        //   * a ";1" version suffix on the file component
+        // e.g. "Assets/Scenes/SC_Default.oct"
+        //   -> "cdrom0:\ASSETS\SCENES\SC_DEFAULT.OCT;1"
+        int n = snprintf(buf, sizeof(buf), "%s\\%s", sBootDevice, rel);
+        if (n < 0) return path;
+        if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+
+        // Start past the device prefix: "cdrom0:" is lowercase by convention and
+        // uppercasing it to "CDROM0:" would stop it resolving. Only the path
+        // that follows gets normalised.
+        int lastSep = devLen;                       // the '\' we just inserted
+        for (int i = devLen; i < n; ++i)
+        {
+            if (buf[i] == '/') buf[i] = '\\';
+            if (buf[i] == '\\') lastSep = i;
+            else if (buf[i] >= 'a' && buf[i] <= 'z') buf[i] = (char)(buf[i] - 'a' + 'A');
+        }
+
+        // Only the file component takes ";1" — directories must not have it.
+        // Skip if the caller already supplied a version.
+        if (memchr(buf + lastSep + 1, ';', (size_t)(n - lastSep - 1)) == nullptr &&
+            n + 2 < (int)sizeof(buf))
+        {
+            buf[n++] = ';';
+            buf[n++] = '1';
+            buf[n]   = '\0';
+        }
         return buf;
     }
 }
@@ -156,6 +548,7 @@ namespace
 bool SYS_DoesFileExist(const char* path, bool /*isAsset*/)
 {
     if (path == nullptr) return false;
+    SifGuard g;
     FILE* f = fopen(WithHostPrefix(path), "rb");
     if (f) { fclose(f); return true; }
     return false;
@@ -169,27 +562,116 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
     if (path == nullptr) return;
 
     const char* resolved = WithHostPrefix(path);
+    // DO NOT log here. On a ps2link rig a log line is a host: write, i.e. a
+    // SIF RPC -- issuing one immediately before this fopen's own RPC, while
+    // the audio thread streams over RPC too, corrupts the shared RPC packet
+    // pool. It crashed in _request_end (sifrpc.c:318) freeing a null packet,
+    // reproducibly, on reaching the streaming audio asset.
+    Ps2_SifLock();
     FILE* f = fopen(resolved, "rb");
+    Ps2_SifUnlock();
     if (f == nullptr)
     {
         LogWarning("SYS_AcquireFileData: fopen failed for '%s'", resolved);
         return;
     }
 
+    // File size: fstat FIRST, fseek/ftell only as a fallback.
+    //
+    // fseek(SEEK_END)+ftell is NOT reliable on cdrom0:. Measured on a real ISO:
+    // SM_Cylinder.oct is 2621 bytes on disc (verified byte-identical with
+    // isoinfo) yet ftell reported 7023. Trusting that over-reads by ~4.4 KB,
+    // pulling in whatever sectors happen to follow the file, and hands Stream a
+    // buffer with a bogus length — which surfaced first as
+    // "ASSERT: stringSize <= MAX_STRING_SIZE" and then as a silent parse
+    // failure. ISO9660 stores the exact length in the directory record, so
+    // fstat is authoritative where it is implemented.
+    Ps2_SifLock();
+    long size = -1;
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && st.st_size > 0)
+    {
+        size = (long)st.st_size;
+    }
+
+    long tellSize = -1;
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    tellSize = ftell(f);
     fseek(f, 0, SEEK_SET);
+    Ps2_SifUnlock();
+
+    if (size < 0) size = tellSize;              // fstat unavailable on this device
     if (size < 0) { fclose(f); return; }
+
+    if (tellSize != size)
+    {
+        LogWarning("[PS2] '%s': fstat says %ld bytes but ftell says %ld — trusting fstat",
+                   resolved, size, tellSize);
+    }
 
     uint32_t actual = (uint32_t)size;
     if (maxSize > 0 && actual > (uint32_t)maxSize) actual = (uint32_t)maxSize;
 
-    outData = (char*)malloc(actual);
+    // 64-byte aligned, sector-rounded allocation.
+    //
+    // cdvdman serves a read that fits inside one 2048-byte sector out of its own
+    // cache with a memcpy, so alignment does not matter there — but a read that
+    // SPANS sectors is DMA'd straight into this buffer, and the DMAC needs the
+    // destination aligned. malloc gives no such guarantee. That is exactly the
+    // observed failure: every asset under 2048 bytes loaded off the disc, and
+    // the first one over it (SM_Cylinder, 7023 bytes) wedged the read.
+    //
+    // Rounding the size up as well keeps the DMA from writing a partial
+    // trailing burst into memory it does not own. SYS_ReleaseFileData's free()
+    // is correct for memalign under newlib.
+    const uint32_t allocSize = (actual + 63u) & ~63u;
+    outData = (char*)memalign(64, allocSize ? allocSize : 64);
     if (outData == nullptr) { fclose(f); return; }
 
-    const size_t read = fread(outData, 1, actual, f);
-    fclose(f);
-    outSize = (uint32_t)read;
+    // Read in a LOOP. A single fread is not sufficient on cdrom0:: the CDVD
+    // driver serves 2048-byte sectors and newlib's glue over cdvdman can return
+    // a short count when a request spans sector boundaries — which is why a
+    // one-sector asset loaded fine off the disc while a four-sector one did not.
+    //
+    // A truncated buffer is worse than a failed read: Stream goes on to parse
+    // whatever happens to follow as asset data, and the damage surfaces a long
+    // way from here as "ASSERT: stringSize <= MAX_STRING_SIZE" in ReadString.
+    // Read in bounded chunks, looping until satisfied or EOF.
+    //
+    // The loop itself is the important part: a single fread can return short and
+    // silently truncate, which Stream then parses as asset data.
+    //
+    // On the chunk size: an earlier revision capped this at one 2048-byte sector
+    // because multi-sector reads appeared to hang. That diagnosis was wrong —
+    // the real fault was the ISO9660 12-character name collision, which had
+    // SM_Cylinder.oct loading SM_Cylinder.DAE, so the *parse* died rather than
+    // the read. ContentPak issues single freads of up to a megabyte through the
+    // same device and they complete fine. A 64 KB chunk keeps the short-read
+    // safety without paying per-call latency on every sector.
+    const uint32_t kSector = 64 * 1024;
+    uint32_t total = 0;
+    int guard = 0;
+    while (total < actual)
+    {
+        uint32_t want = actual - total;
+        if (want > kSector) want = kSector;
+        Ps2_SifLock();
+        const size_t got = fread(outData + total, 1, (size_t)want, f);
+        Ps2_SifUnlock();
+        // Bring-up probe: names the exact iteration if a multi-sector read
+        // stalls. Only fires for files that need more than one pass.
+        if (got == 0) break;                    // EOF or hard error
+        total += (uint32_t)got;
+        if (++guard > 8192) { LogError("[PS2] read loop stuck on '%s'", resolved); break; }
+    }
+    Ps2_SifLock(); fclose(f); Ps2_SifUnlock();
+
+    if (total != actual)
+    {
+        LogWarning("SYS_AcquireFileData: short read on '%s' — got %u of %u bytes",
+                   resolved, (unsigned)total, (unsigned)actual);
+    }
+    outSize = total;
 }
 
 void SYS_ReleaseFileData(char* data)
@@ -931,7 +1413,7 @@ bool SYS_DoesSaveExist(const char* saveName)
     const std::string path = HostFallbackPath(saveName);
     FILE* f = fopen(WithHostPrefix(path.c_str()), "rb");
     if (f == nullptr) return false;
-    fclose(f);
+    Ps2_SifLock(); fclose(f); Ps2_SifUnlock();
     return true;
 }
 
@@ -994,12 +1476,41 @@ std::string SYS_GetClipboardText() { return ""; }
 static const char* sLogFilePath = "host:ps2-addon.log";
 static FILE*       sLogFile     = nullptr;
 
+// Log cost accounting. Every line is a synchronous host: write RPC (a network
+// round trip under ps2link) plus a framebuffer text render, and BOTH happen
+// outside the renderer's timing window -- so this cost is invisible in the
+// frame profile even though it still lengthens the frame. File and screen are
+// timed separately so a slow write can be told apart from a slow scr_printf.
+static uint64_t sLogFileUs = 0;
+static uint64_t sLogScrUs  = 0;
+static uint32_t sLogLines  = 0;
+
+// scr_printf renders every line into the framebuffer. That is worth ~0.6 ms
+// per line and is only useful before the renderer owns the screen, so the
+// graphics layer turns it off once it is up (Ps2_SetLogToScreen).
+static bool     sLogToScreen = true;
+// fopen on a failed device must be tried ONCE. Without this the sink retries
+// the open on every single line -- harmless on host:, ruinous on cdrom0:,
+// where a disc build has no host: file to open at all.
+static bool     sLogOpenTried = false;
+
+void Ps2_SetLogToScreen(bool enable) { sLogToScreen = enable; }
+
+void Ps2_GetLogCost(uint64_t* fileUs, uint64_t* scrUs, uint32_t* lines)
+{
+    if (fileUs != nullptr) *fileUs = sLogFileUs;
+    if (scrUs  != nullptr) *scrUs  = sLogScrUs;
+    if (lines  != nullptr) *lines  = sLogLines;
+    sLogFileUs = 0; sLogScrUs = 0; sLogLines = 0;
+}
+
 void Ps2_AppendLogLineRaw(const char* line)
 {
     if (line == nullptr) return;
 
-    if (sLogFile == nullptr)
+    if (sLogFile == nullptr && !sLogOpenTried)
     {
+        sLogOpenTried = true;
         // Open with "w" on first use — truncate stale logs from prior runs
         // so a fresh launch doesn't append to a 100 MB file.
         sLogFile = fopen(sLogFilePath, "w");
@@ -1013,13 +1524,21 @@ void Ps2_AppendLogLineRaw(const char* line)
 
     if (sLogFile != nullptr)
     {
+        const uint64_t fT0 = SYS_GetTimeMicroseconds();
         fputs(line, sLogFile);
         fputc('\n', sLogFile);
         // Don't fflush on every line — _IOLBF already flushes on '\n'.
+        sLogFileUs += SYS_GetTimeMicroseconds() - fT0;
     }
 
     // Boot-tty mirror so very-early-boot crashes leave on-screen evidence.
-    scr_printf("%s\n", line);
+    if (sLogToScreen)
+    {
+        const uint64_t sT0 = SYS_GetTimeMicroseconds();
+        scr_printf("%s\n", line);
+        sLogScrUs += SYS_GetTimeMicroseconds() - sT0;
+    }
+    ++sLogLines;
 }
 
 void SYS_Log(LogSeverity severity, const char* format, va_list arg)

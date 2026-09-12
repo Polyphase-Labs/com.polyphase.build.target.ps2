@@ -67,15 +67,29 @@ file(GLOB_RECURSE HEADERS "Source/*.h" "Source/*.hpp")
 # Create shared library
 add_library(com.polyphase.build.target.ps2 SHARED ${SOURCES} ${HEADERS})
 
-# Find Vulkan SDK
+# Find Vulkan headers. Engine headers include vulkan/vulkan.h under
+# API_VULKAN, so this is required even if the addon never uses Vulkan.
+set(VULKAN_INCLUDE_DIR "")
 if(DEFINED ENV{VULKAN_SDK})
-    set(VULKAN_SDK_PATH $ENV{VULKAN_SDK})
-else()
-    find_package(Vulkan QUIET)
-    if(Vulkan_FOUND)
-        get_filename_component(VULKAN_SDK_PATH ${Vulkan_INCLUDE_DIRS} DIRECTORY)
+    if(EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
+        set(VULKAN_INCLUDE_DIR "$ENV{VULKAN_SDK}/Include")
+    elseif(EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
+        set(VULKAN_INCLUDE_DIR "$ENV{VULKAN_SDK}/include")
     endif()
 endif()
+if(NOT VULKAN_INCLUDE_DIR AND EXISTS "${POLYPHASE_PATH}/External/Vulkan/include/vulkan/vulkan.h")
+    set(VULKAN_INCLUDE_DIR "${POLYPHASE_PATH}/External/Vulkan/include")
+endif()
+if(NOT VULKAN_INCLUDE_DIR)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        set(VULKAN_INCLUDE_DIR "${Vulkan_INCLUDE_DIRS}")
+    endif()
+endif()
+if(NOT VULKAN_INCLUDE_DIR)
+    message(FATAL_ERROR "Vulkan headers not found. Install the Vulkan SDK from https://vulkan.lunarg.com/sdk/home and set VULKAN_SDK, or use an engine install that ships External/Vulkan/include.")
+endif()
+message(STATUS "Polyphase: using Vulkan headers from ${VULKAN_INCLUDE_DIR}")
 
 # Include directories
 target_include_directories(com.polyphase.build.target.ps2 PRIVATE
@@ -93,10 +107,8 @@ target_include_directories(com.polyphase.build.target.ps2 PRIVATE
     ${POLYPHASE_PATH}/External/Vorbis
 )
 
-# Add Vulkan SDK include path if found
-if(VULKAN_SDK_PATH)
-    target_include_directories(com.polyphase.build.target.ps2 PRIVATE ${VULKAN_SDK_PATH}/Include)
-endif()
+# Vulkan headers (resolved above)
+target_include_directories(com.polyphase.build.target.ps2 PRIVATE ${VULKAN_INCLUDE_DIR})
 
 # Compile definitions
 target_compile_definitions(com.polyphase.build.target.ps2 PRIVATE
