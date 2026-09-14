@@ -123,6 +123,7 @@ SOURCES = \
     $(POLYPHASE_PATH)/Engine/Source/Engine/UI \
     $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline \
     $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline/Tracks \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Utils \
     $(POLYPHASE_PATH)/Engine/Source/Plugins \
     $(POLYPHASE_PATH)/Engine/Source/System \
     $(POLYPHASE_PATH)/Engine/Source/Graphics \
@@ -198,6 +199,48 @@ CPPFILES += $(ADDON_CPPFILES_EXTRA)
 VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
 EE_OBJS := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 
+# ---- VU1 microcode ----------------------------------------------------------
+# The VU1 rendering pipeline is hand-written vector-unit assembly vendored from
+# XTC (https://github.com/aap/xtc, MIT — see vu1/LICENSE.xtc). It is assembled
+# by `dvp-as`, a SEPARATE assembler from ee-gcc: it targets the VU/DMA/VIF
+# instruction set, not MIPS, and emits .vutext/.vudata sections that the EE
+# linker places into the ELF like any other object.
+#
+# Verified 2026-09-10: ps2dev ships GNU binutils 2.45.1 built for the `dvp`
+# target, and it accepts XTC's Sony-syntax source (DMAret / MPG / .EndMPG /
+# .EndDmaData / .vu mode) unmodified. The resulting object links cleanly into a
+# mips64r5900el-ps2-elf ELF with all relocations resolved.
+#
+# Two-step, mirroring xtc/Makefile:
+#   1. joinvu strips `;' comments and joins backslash continuations, so that
+#      the C preprocessor can run over VU assembly (cpp would choke on `;'
+#      comments and on multi-line macros otherwise).
+#   2. cpp expands the #define'd register/attribute accessors, `grep -v '^#''
+#      drops the resulting line markers (dvp-as has no use for them), and
+#      dvp-as assembles.
+#
+# NOT passed (they are SCE ee-dvp-as options that GNU dvp-as does not have):
+#   -stalls-pipeline  the microcode is hand-scheduled with explicit nops
+#   -no-fetching      likewise
+#   -alm=             produced a listing file we do not consume
+VU1_DIR    := $(ADDON_PS2_RUNTIME)/Graphics_PS2GS/vu1
+DVP_AS     := $(PS2DEV)/dvp/bin/dvp-as
+VU1_DSM    := $(wildcard $(VU1_DIR)/*.dsm)
+VU1_OBJS   := $(notdir $(VU1_DSM:.dsm=.o))
+# Every .dsm .include's the .vu/.inc fragments beside it, so any of them
+# changing must force a re-assemble.
+VU1_DEPS   := $(wildcard $(VU1_DIR)/*.vu) $(wildcard $(VU1_DIR)/*.inc)
+
+# joinvu is invoked through `sh` rather than executed directly: the addon tree
+# is usually on an NTFS mount inside WSL, where the executable bit does not
+# survive, so ./joinvu would fail with "Permission denied".
+%.o: $(VU1_DIR)/%.dsm $(VU1_DEPS)
+	sh $(VU1_DIR)/joinvu $< | $(EE_CC) -E -x assembler-with-cpp -I$(VU1_DIR) - \
+	    | grep -v '^#' > $*.dsm_x
+	$(DVP_AS) -I$(VU1_DIR) $*.dsm_x -o $@
+
+EE_OBJS += $(VU1_OBJS)
+
 # ---- audsrv.irx embedding ---------------------------------------------------
 # audsrv runs on the IOP and is the standard PS2 software audio mixer. We
 # embed audsrv.irx into the ELF so SifLoadModuleBuffer can hand it to the
@@ -237,6 +280,48 @@ audsrv_irx.o: audsrv_irx.c
 	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
 EE_OBJS += audsrv_irx.o
 
+# ---- MMCE (SD2PSX / MemCard PRO) --------------------------------------------
+# mmceman exposes the device's REAL SD filesystem as mmce0:, separate from the
+# 8 MB emulated memory card at mc0:. That matters for shipping a build to one:
+# a full asset tree does not fit in an 8 MB card image, but does fit on the SD.
+# mmcedrv adds the faster bulk-transfer path; without it mmceman still works,
+# just slower, so a failure to load it is not fatal.
+# mmceman imports iomanX (the extended I/O manager) and registers through it,
+# NOT through plain ioman. Without iomanX + fileXio the module load fails with
+# -200 and mmce0: never exists, which is exactly what hardware showed.
+IOMANX_IRX_SRC  = $(PS2SDK)/iop/irx/iomanX.irx
+FILEXIO_IRX_SRC = $(PS2SDK)/iop/irx/fileXio.irx
+MMCEMAN_IRX_SRC = $(PS2SDK)/iop/irx/mmceman.irx
+MMCEDRV_IRX_SRC = $(PS2SDK)/iop/irx/mmcedrv.irx
+
+iomanx_irx.c: $(IOMANX_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ iomanx_irx
+iomanx_irx.o: iomanx_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += iomanx_irx.o
+
+filexio_irx.c: $(FILEXIO_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ filexio_irx
+filexio_irx.o: filexio_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += filexio_irx.o
+
+mmceman_irx.c: $(MMCEMAN_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ mmceman_irx
+mmceman_irx.o: mmceman_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += mmceman_irx.o
+
+mmcedrv_irx.c: $(MMCEDRV_IRX_SRC) $(ADDON_PS2_RUNTIME)/../../Makefile_PS2
+	rm -f $@
+	$(PS2SDK)/bin/bin2c $< $@ mmcedrv_irx
+mmcedrv_irx.o: mmcedrv_irx.c
+	$(EE_CC) $(EE_CFLAGS) -c $< -o $@
+EE_OBJS += mmcedrv_irx.o
+
 # ---- Flags ------------------------------------------------------------------
 # Variant 2 platform-extension flag plus PS2-native macros. Makefile.eeglobal_cpp
 # will prepend -D_EE -G0 -O2 etc. — do NOT add -G0 ourselves; overriding breaks
@@ -275,7 +360,15 @@ EE_ASFLAGS  = $(EE_CFLAGS)
 # ---- Libraries --------------------------------------------------------------
 # gsKit + dmaKit live in $(PS2SDK)/ports/lib. Standard EE libs (-lkernel, -lc)
 # are in $(PS2SDK)/ee/lib. Order is strict left-to-right ld resolution:
-# gsKit_toolkit → gsKit → dmaKit → patches → debug → m → c → kernel.
+# gsKit_toolkit → gsKit → dmaKit → packet2 → dma → patches → debug → m → c → kernel.
+#
+# -lpacket2 / -ldma are ps2sdk's own DMA/VIF packet builder and DMA channel
+# driver, used by the VU1 geometry path (Runtime/PS2/Graphics_PS2GS/
+# PS2VU1Pipe.cpp): packet2_create/reset/free come from libpacket2, while
+# dma_channel_send_packet2 and dma_channel_wait come from libdma. Neither
+# references the other, so their relative order is free — but both must precede
+# -lc / -lkernel. These are distinct from gsKit's own dmaKit, which only opens
+# and configures channels and cannot send a packet2 chain.
 #
 # Phase 0-2 doesn't need libpad / libmc / audsrv — those arrive with the
 # respective subsystem implementations in Phase 3+.
@@ -289,8 +382,9 @@ EE_LIBDIR = -L$(PS2SDK)/ports/lib -L$(PS2SDK)/ee/lib -L$(PS2DEV)/gsKit/lib $(add
 EE_LDFLAGS = $(EE_LIBDIR) -Wl,--allow-multiple-definition
 EE_LIBS = \
     -lgskit_toolkit -lgskit -ldmakit \
+    -lpacket2 -ldma \
     -laudsrv -lpad -lmc \
-    -lfileXio -lpatches -ldebug \
+    -lfileXio -lpatches -ldebug -lcdvd \
     -lm -lc -lkernel -latomic \
     $(addprefix -l,$(ADDON_LIBS))
 # -laudsrv: EE-side stubs that RPC into the audsrv IRX (loaded by

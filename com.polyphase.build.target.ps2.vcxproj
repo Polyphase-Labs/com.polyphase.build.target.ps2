@@ -72,7 +72,7 @@
       <PreprocessorDefinitions>OCTAVE_PLUGIN_EXPORT;EDITOR=1;LUA_ENABLED=1;GLM_FORCE_RADIANS;PLATFORM_WINDOWS=1;API_VULKAN=1;NOMINMAX;COMPOLYPHASEBUILDTARGETPS2_EXPORTS;_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(PolyphasePath)Engine\Source;$(PolyphasePath)Engine\Source\Engine;$(PolyphasePath)Engine\Source\Plugins;$(PolyphasePath)External;$(PolyphasePath)External\Assimp;$(PolyphasePath)External\Bullet;$(PolyphasePath)External\Lua;$(PolyphasePath)External\glm;$(PolyphasePath)External\Imgui;$(PolyphasePath)External\ImGuizmo;$(PolyphasePath)External\Vorbis;$(VULKAN_SDK)\Include;$(ProjectDir)Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(PolyphasePath)\Engine\Source;$(PolyphasePath)\Engine\Source\Engine;$(PolyphasePath)\Engine\Source\Plugins;$(PolyphasePath)\External;$(PolyphasePath)\External\Assimp;$(PolyphasePath)\External\Bullet;$(PolyphasePath)\External\Lua;$(PolyphasePath)\External\glm;$(PolyphasePath)\External\Imgui;$(PolyphasePath)\External\ImGuizmo;$(PolyphasePath)\External\Vorbis;C:\VulkanSDK\1.3.275.0\Include;$(VULKAN_SDK)\Include;$(ProjectDir)Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -90,7 +90,7 @@
       <PreprocessorDefinitions>OCTAVE_PLUGIN_EXPORT;EDITOR=1;LUA_ENABLED=1;GLM_FORCE_RADIANS;PLATFORM_WINDOWS=1;API_VULKAN=1;NOMINMAX;COMPOLYPHASEBUILDTARGETPS2_EXPORTS;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(PolyphasePath)Engine\Source;$(PolyphasePath)Engine\Source\Engine;$(PolyphasePath)Engine\Source\Plugins;$(PolyphasePath)External;$(PolyphasePath)External\Assimp;$(PolyphasePath)External\Bullet;$(PolyphasePath)External\Lua;$(PolyphasePath)External\glm;$(PolyphasePath)External\Imgui;$(PolyphasePath)External\ImGuizmo;$(PolyphasePath)External\Vorbis;$(VULKAN_SDK)\Include;$(ProjectDir)Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(PolyphasePath)\Engine\Source;$(PolyphasePath)\Engine\Source\Engine;$(PolyphasePath)\Engine\Source\Plugins;$(PolyphasePath)\External;$(PolyphasePath)\External\Assimp;$(PolyphasePath)\External\Bullet;$(PolyphasePath)\External\Lua;$(PolyphasePath)\External\glm;$(PolyphasePath)\External\Imgui;$(PolyphasePath)\External\ImGuizmo;$(PolyphasePath)\External\Vorbis;C:\VulkanSDK\1.3.275.0\Include;$(VULKAN_SDK)\Include;$(ProjectDir)Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>

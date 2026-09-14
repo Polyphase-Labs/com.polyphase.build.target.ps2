@@ -66,10 +66,123 @@
 
 #include "PS2GSTypes.h"
 #include "PS2GSUtils.h"
+#include "PS2VU1Pipe.h"
 
 namespace
 {
     GSGLOBAL* sGsGlobal = nullptr;
+
+    // ---- VU1 path switch + draw-cost stats -------------------------------
+    // Master switch for the VU1 mesh path. Both paths are compiled in so one
+    // build can A/B them; flip this to compare frame times on identical
+    // geometry. Phase 3 will expose it as a Build Profile option.
+    bool sUseVu1Path = true;
+
+    // When 1, the two paths alternate every second so a single run produces an
+    // interleaved A/B on identical geometry. Set to 0 to pin whichever value
+    // sUseVu1Path is initialised to above.
+    #define PS2_VU1_AB_MEASURE 0   // 1 = alternate VU1/EE each second to A/B on hardware
+
+    // Which microcode entry point the VU1 mesh path uses. Clipping is required
+    // for anything that can cross the near plane, but the clipping routine
+    // (TLClip) has more VU state and a deeper call graph than the plain
+    // Process path — so it is kept switchable to isolate it when the two
+    // differ between PCSX2 and hardware.
+    bool sVu1Clipping = true;
+
+    // There is no GPU timestamp on the GS (GFX_Begin/EndGpuTimestamp are
+    // stubs), so "cost" here is EE wall time per frame — which is exactly the
+    // quantity the VU1 path is meant to reduce.
+    struct FrameStats
+    {
+        uint32_t mTrisEE     = 0;
+        uint32_t mTrisVU1    = 0;
+        uint32_t mTrisCulled = 0;
+        uint32_t mTrisVC     = 0;   // TileMap2D / Terrain3D / Voxel3D triangles
+        uint64_t mMeshUs     = 0;   // EE time inside DrawTrisHelper
+        uint64_t mShadeUs    = 0;   // of which: per-vertex lighting
+        uint64_t mVcUs       = 0;   // EE time inside DrawVertexColorMesh
+        uint64_t mVifWaitUs  = 0;   // of mMeshUs: blocked on the previous VIF1 send
+        uint32_t mKicks      = 0;   // VU1 batches kicked
+        uint32_t mTexUploads = 0;   // textures re-sent to VRAM this frame
+        uint32_t mGsQueuePeak = 0;  // high-water bytes used in gsKit's Oneshot pool
+        uint64_t mVcPixels   = 0;   // tilemap/voxel screen-space pixels filled
+        // UI draw counts. The 'rest' bucket grows ~3.5 ms over the first few
+        // seconds while triangle counts stay flat, so something in the widget
+        // tree is multiplying. Counting the calls says which kind.
+        uint32_t mQuads      = 0;   // GFX_DrawQuad
+        uint32_t mTexts      = 0;   // GFX_DrawText
+        uint32_t mGlyphs     = 0;   // glyph quads inside those texts
+        uint32_t mPolys      = 0;   // GFX_DrawPoly
+        uint64_t mUiUs       = 0;   // EE time in the UI draw calls
+        // Whole-frame accounting. WORK + vsync-wait has never covered the
+        // entire frame -- engine tick, Lua and physics run before
+        // GFX_BeginFrame, and log writes land after both timers stop.
+        uint64_t mPeriodUs   = 0;   // BeginFrame to BeginFrame
+        uint64_t mLogFileUs  = 0;
+        uint64_t mLogScrUs   = 0;
+        uint32_t mLogLines   = 0;
+        // Split the mesh path's EE time: VIF-wait came back at ~93 us, so the
+        // EE is NOT blocked on DMA and the ~6.8 ms is real work. These two say
+        // which half of it.
+        uint64_t mCullUs     = 0;   // backface cull pass (incl. flat build)
+        uint64_t mPushUs     = 0;   // PushVertex loop
+        uint64_t mSegUs      = 0;   // gsKit->VU1 segment barrier (queue_exec + GIF drain)
+        uint64_t mDrawUs  = 0;
+        uint64_t mWaitUs  = 0;
+    };
+}
+
+// Defined in System_PS2.cpp. Log lines are synchronous host: writes plus a
+// framebuffer render, and they happen AFTER this frame's timers stop, so
+// they are invisible in WORK and vsync-wait yet still lengthen the frame.
+extern void Ps2_GetLogCost(uint64_t* fileUs, uint64_t* scrUs, uint32_t* lines);
+extern void Ps2_GetIoStats(uint32_t* files, uint64_t* bytes, uint64_t* us);
+extern void Ps2_GetStreamStats(uint32_t* submits, uint32_t* rejects, uint32_t* underruns);
+
+namespace
+{
+    // Frame-limiter bisection. Cutting EE time has stopped moving the frame
+    // period, so before optimising anything further, find out what the period
+    // is actually made of -- including GS fill, which no EE timer can see.
+    // Cycles once per second so a single run yields every data point:
+    //   0 = normal   1 = no 3D meshes   2 = no tilemap   3 = neither
+    //   4 = everything, but the tilemap drawn with alpha blending OFF
+    //   5 = everything, but the tilemap drawn UNTEXTURED. gsKit emits a TEX0
+    //       in every per-triangle packet; a redundant TEX0 write invalidates
+    //       the GS texture cache, so 192 triangles can mean 192 reloads of a
+    //       32 KB texture. That is the only mechanism left that fits 7.3 ms.
+    // Set to 0 to disable.
+#define PS2_PROFILE_BISECT 0
+#if PS2_PROFILE_BISECT
+    int sBisectMode = 0;
+    int sBisectDwell = 0;
+#else
+    const int sBisectMode = 0;
+#endif
+
+    FrameStats sStats;
+    FrameStats sStatsAccum;
+    uint32_t   sStatsFrames    = 0;
+    uint64_t   sStatsLastLogUs = 0;
+    uint64_t   sFrameStartUs   = 0;
+    uint64_t   sPrevFrameStartUs = 0;
+
+    // gsKit's TexManager evicts textures when VRAM runs out and re-uploads them
+    // on the next bind. If the working set does not fit, that re-upload happens
+    // EVERY FRAME -- a GS/DMA cost no EE timer can see. Counting binds that
+    // found Vram == 0 measures the thrash directly.
+    // Set true only while a tilemap/voxel draw is in flight; Ps2_MakeTex0 reads
+    // it to emit TEX0 with TFX=DECAL. Unused now that the colour scale is fixed,
+    // but kept because it is the cheapest way to re-test "ignore vertex colour".
+    bool sVcForceDecal = false;
+
+    inline void BindTex(GSTEXTURE* tex)
+    {
+        if (tex->Vram == 0) ++sStats.mTexUploads;
+        gsKit_TexManager_bind(sGsGlobal, tex);
+    }
+
 
     // Scene fog, stashed by GFX_SetFog (called every frame from Renderer::BeginFrame)
     // and consumed as per-vertex GS hardware fog in the mesh draw helpers.
@@ -118,12 +231,21 @@ namespace
 
     void InitGs()
     {
-        // Use custom queue sizes — gsKit's default Persistent queue is 256 KB
-        // and Oneshot is 1 MB. With ~6000 triangles per frame at ~100 bytes
-        // per gsKit_prim_triangle GIF packet, even Oneshot's 1 MB can fill
-        // up under load. Bump Oneshot to 4 MB so we have headroom for
-        // complex scenes; Persistent stays small since we mostly use Oneshot.
-        constexpr int kOsQueueBytes  = 4 * 1024 * 1024;
+        // gsKit allocates pool[2] for the Oneshot queue (see GSQUEUE::dbuf), so
+        // this figure is paid TWICE out of the EE's 32 MB.
+        //
+        // It used to be 4 MB - i.e. 8 MB of RAM - sized for "~6000 triangles a
+        // frame at ~100 bytes per gsKit_prim_triangle packet". The VU1 work made
+        // that premise obsolete: static meshes, skeletal meshes and the tilemap
+        // all build their own packet2 chains on PATH1 and never touch this queue.
+        // What is left on it is the skybox (~180 tris), UI text (~122 tris) and
+        // particles - tens of KB, not megabytes.
+        //
+        // 8 MB of dead reservation was enough to make a 1 MB texture load fail
+        // with std::bad_alloc while the heap still showed 236 KB free. Back to
+        // gsKit's own default; sStats.mGsQueuePeak tracks headroom so this can be
+        // re-tuned from evidence rather than guesswork.
+        constexpr int kOsQueueBytes  = 1 * 1024 * 1024;
         constexpr int kPerQueueBytes = 256 * 1024;
         sGsGlobal = gsKit_init_global_custom(kOsQueueBytes, kPerQueueBytes);
         if (sGsGlobal == nullptr)
@@ -145,9 +267,25 @@ namespace
 
         // dmaKit must be inited BEFORE gsKit_init_screen — that call
         // submits its first DMA. GIF_MODE_NORMAL = standard non-chained DMA.
+        //
+        // The last argument is `fastwaitchannels`, NOT a channel-enable mask.
+        // Fast waits spin on the EE's CPCOND0 signal, which only goes high once
+        // EVERY channel named in that mask has signalled completion. Adding
+        // VIF1 here deadlocks the boot: VIF1 has never run at init time, so its
+        // bit never sets, CPCOND0 never rises, and the first gsKit_queue_exec
+        // in the clear loop below waits forever. Leave it as the GIF channel
+        // alone — opening a channel is dmaKit_chan_init's job, below.
         dmaKit_init(D_CTRL_RELE_OFF, D_CTRL_MFD_OFF, D_CTRL_STS_UNSPEC,
                     D_CTRL_STD_OFF, D_CTRL_RCYC_8, 1 << DMA_CHANNEL_GIF);
         dmaKit_chan_init(DMA_CHANNEL_GIF);
+
+        // VIF1 (channel 1) carries the VU1 geometry path's DMA chains
+        // (PS2VU1Pipe.cpp). gsKit itself never touches VIF1 or VU1 — its own
+        // gsVU1.h is an empty stub — so PATH1 is entirely ours, and only the
+        // *ordering* between the two channels has to be managed (see
+        // ps2vu1::BeginSegment). VIF1 deliberately stays off the fast-wait list
+        // so it uses the ordinary D_CHCR.STR poll instead.
+        dmaKit_chan_init(DMA_CHANNEL_VIF1);
 
         gsKit_init_screen(sGsGlobal);
 
@@ -170,6 +308,7 @@ namespace
         // NDC z = +1 (far) → iz=0 so "closer to camera" produces larger
         // gsKit `iz` values, which satisfies the GEQUAL test.
         gsKit_set_test(sGsGlobal, GS_ZTEST_ON);
+        ps2vu1::NoteGsKitWrite();
         // Alpha test stays OFF — gsKit's default ATST=GEQUAL with AREF=0x80
         // is a binary cutoff that kills antialiased font glyph edges
         // (anything below 50% alpha gets discarded → pixelated text).
@@ -189,6 +328,27 @@ namespace
         // PerPixel=0 disables PABE so the blend equation applies to every
         // fragment uniformly, letting alpha=0 → output = dst (transparent).
         gsKit_set_primalpha(sGsGlobal, GS_SETREG_ALPHA(0, 1, 0, 1, 0x80), 0);
+        ps2vu1::NoteGsKitWrite();
+
+        // PRMODECONT=1: the GS takes IIP/TME/FGE/ABE/FST from the PRIM field of
+        // each GIFtag rather than from the PRMODE register. gsKit's prim helpers
+        // already assume this (they emit full GS_SETREG_PRIM values), and the
+        // VU1 path in PS2VU1Pipe.cpp composes its PRIM the same way — so both
+        // streams stay consistent and last-writer-wins is the correct semantic.
+        //
+        // Asserted explicitly here, in the PERSISTENT queue, rather than relying
+        // on gsKit's internal init: gsKit_queue_exec re-sends the persistent
+        // queue every time, so this survives the extra queue flushes that VU1
+        // frame segmentation introduces.
+        {
+            u64* p = (u64*)gsKit_heap_alloc(sGsGlobal, 1, 16, GIF_AD);
+            ps2vu1::NoteGsKitWrite();
+            *p++ = GIF_TAG_AD(1);
+            *p++ = GIF_AD;
+            *p++ = GS_SETREG_PRMODECONT(1);
+            *p++ = GS_PRMODECONT;
+        }
+
         gsKit_mode_switch(sGsGlobal, GS_ONESHOT);
 
         // gsKit's texture manager keeps a per-frame ring of recently-bound
@@ -208,11 +368,18 @@ namespace
         for (int i = 0; i < 2; ++i)
         {
             gsKit_clear(sGsGlobal, kClearColor);
+            ps2vu1::NoteGsKitWrite();
             gsKit_queue_exec(sGsGlobal);
             gsKit_sync_flip(sGsGlobal);
         }
 
         GetEngineState()->mSystem.mGsGlobal = sGsGlobal;
+
+        // VU1 geometry pipeline. Reads Width/Height and OffsetX/OffsetY off the
+        // GSGLOBAL, so it must come after gsKit_init_screen. A failure here is
+        // not fatal — the EE draw path keeps working, ps2vu1::IsReady() just
+        // stays false.
+        ps2vu1::Init(sGsGlobal);
 
         // Install the vblank-yield interrupt so GFX_EndFrame can sleep the EE for
         // vsync instead of busy-spinning (keeps the emulated IOP / audsrv fed).
@@ -224,9 +391,23 @@ namespace
     }
 }
 
+extern void Ps2_SetLogToScreen(bool enable);   // System_PS2.cpp
+
 void GFX_Initialize()
 {
     InitGs();
+    // The renderer owns the display from here, so the boot-tty mirror is
+    // both invisible and expensive (~0.6 ms per log line). Turn it off.
+    Ps2_SetLogToScreen(false);
+
+    // VRAM budget. 4 MB total; whatever the framebuffers and Z do not use is
+    // all the texture manager has to work with.
+    if (sGsGlobal != nullptr)
+    {
+        const unsigned used = (unsigned)sGsGlobal->CurrentPointer;
+        LogDebug("[PS2] VRAM: framebuffers+Z use %u bytes, %u bytes left for textures",
+                 used, (unsigned)(4u * 1024u * 1024u - used));
+    }
 }
 
 void GFX_Shutdown()
@@ -234,6 +415,7 @@ void GFX_Shutdown()
     // gsKit_deinit_global is not strictly required — the BIOS reclaims VRAM
     // on ELF exit. Leaving the global pointer alone keeps post-shutdown
     // log calls (which might still reach SystemState) safe.
+    ps2vu1::Shutdown();
     sGsGlobal = nullptr;
     GetEngineState()->mSystem.mGsGlobal = nullptr;
 }
@@ -248,12 +430,80 @@ void GFX_BeginFrame()
     // the previous frame (alpha 0x00 would no-op under the active
     // (Cs-Cd)*As+Cd blend, causing ghost trails).
     gsKit_clear(sGsGlobal, GS_SETREG_RGBAQ(0x00, 0x00, 0x00, 0x80, 0));
+    ps2vu1::NoteGsKitWrite();
+
+    sPrevFrameStartUs = sFrameStartUs;
+    sFrameStartUs = SYS_GetTimeMicroseconds();
 }
+
+// ---- VU1 bring-up test ------------------------------------------------------
+// Set to 0 to remove. Draws two identical gouraud triangles 100px apart: the
+// left one through gsKit's EE path, the right one transformed by VU1.
+//
+// This has to run HERE — after every engine draw is queued but before
+// queue_exec and the flip. The OctPreUpdate/OctPostUpdate hooks both sit
+// outside the render frame (Engine.cpp:2294-2296 brackets Update(), which
+// contains the whole clear->draw->flip), so drawing from either would land in a
+// buffer that is immediately cleared or flipped away.
+//
+// Reading the result:
+//   BOTH triangles, identical      -> VU1 path works and ordering is correct
+//   only the LEFT one              -> VU1 produced no primitive
+//   only the RIGHT one             -> the deferred gsKit_clear is landing after
+//                                     the VU1 kick; the barrier is wrong
+//   frozen frame                   -> a DMA channel is stuck in dma_channel_wait
+#define PS2_VU1_BRINGUP_DEMO 0   // Phase 1 passed; set to 1 to re-verify the pipeline
+
+// Phase 2 test mesh: a rotating grid of lit cubes pushed through the real
+// DrawTrisHelper path, so the VU1 mesh path can be validated and measured
+// without depending on scene/asset loading. Set to 0 to remove.
+#define PS2_VU1_TESTMESH 0   // scene loads now; 36 tiny draws skewed the barrier measurement
+
+// All defined further down this file; forward-declared so GFX_EndFrame can
+// reach them without moving their definitions.
+#if PS2_VU1_BRINGUP_DEMO
+extern "C" void GFX_DrawTriangleDemo();
+extern "C" void GFX_DrawTriangleVU1Demo();
+#endif
+#if PS2_VU1_TESTMESH
+extern "C" void GFX_DrawTestMesh();
+#endif
 
 void GFX_EndFrame()
 {
     if (sGsGlobal == nullptr) return;
+
+#if PS2_VU1_BRINGUP_DEMO
+    GFX_DrawTriangleDemo();      // EE / gsKit reference triangle
+    GFX_DrawTriangleVU1Demo();   // same triangle, +100px, via VU1
+#endif
+#if PS2_VU1_TESTMESH
+    GFX_DrawTestMesh();          // lit cube grid through the real mesh path
+#endif
+
+    // Any VU1 transfer still in flight has to retire before gsKit sends its
+    // chain, or a live PATH1 will preempt it and splice VU1 primitives into the
+    // gsKit stream. EndSegment defers this wait so back-to-back VU1 meshes do
+    // not stall; frame end is where it finally has to happen.
+    ps2vu1::FlushBeforeGsKit();
+
+    if (sGsGlobal->Os_Queue != nullptr)
+    {
+        const char* base = (const char*)sGsGlobal->Os_Queue->pool[sGsGlobal->Os_Queue->dbuf];
+        const char* cur  = (const char*)sGsGlobal->Os_Queue->pool_cur;
+        if (cur > base)
+        {
+            const uint32_t used = (uint32_t)(cur - base);
+            if (used > sStats.mGsQueuePeak) sStats.mGsQueuePeak = used;
+        }
+    }
     gsKit_queue_exec(sGsGlobal);
+
+    // Work time ends HERE, before the vblank sleep below. Sampling after the
+    // sleep measures the display refresh, not the rendering: both paths wait
+    // out the same vblank and report an identical frame time, which is exactly
+    // what the first A/B run showed (~29.1 ms for both).
+    const uint64_t workEndUs = SYS_GetTimeMicroseconds();
 
     // Sleep the EE until vblank on the interrupt semaphore instead of letting
     // gsKit_sync_flip busy-spin the whole frame — that spin starves the emulated
@@ -288,6 +538,123 @@ void GFX_EndFrame()
         gsKit_sync_flip(sGsGlobal);       // fallback if the vblank sema failed to install
     }
 
+    // ---- Draw-cost stats ------------------------------------------------
+    // Accumulate and log once a second. Reported as EE microseconds spent
+    // inside the frame plus the triangle split between the two paths, so the
+    // VU1 path can be A/B'd against the EE path on identical geometry by
+    // flipping sUseVu1Path.
+    {
+        const uint64_t nowUs = SYS_GetTimeMicroseconds();
+        sStatsAccum.mTrisEE     += sStats.mTrisEE;
+        sStatsAccum.mTrisVU1    += sStats.mTrisVU1;
+        sStatsAccum.mTrisCulled += sStats.mTrisCulled;
+        sStatsAccum.mTrisVC     += sStats.mTrisVC;
+        sStatsAccum.mMeshUs     += sStats.mMeshUs;
+        sStatsAccum.mShadeUs    += sStats.mShadeUs;
+        sStatsAccum.mVcUs       += sStats.mVcUs;
+        sStatsAccum.mCullUs     += sStats.mCullUs;
+        sStatsAccum.mPushUs     += sStats.mPushUs;
+        sStatsAccum.mSegUs      += sStats.mSegUs;
+        sStatsAccum.mVifWaitUs  += ps2vu1::GetVifWaitUs();
+        sStatsAccum.mTexUploads += sStats.mTexUploads;
+        if (sStats.mGsQueuePeak > sStatsAccum.mGsQueuePeak)
+            sStatsAccum.mGsQueuePeak = sStats.mGsQueuePeak;
+        sStatsAccum.mVcPixels   += sStats.mVcPixels;
+        sStatsAccum.mQuads      += sStats.mQuads;
+        sStatsAccum.mTexts      += sStats.mTexts;
+        sStatsAccum.mGlyphs     += sStats.mGlyphs;
+        sStatsAccum.mPolys      += sStats.mPolys;
+        sStatsAccum.mUiUs       += sStats.mUiUs;
+        sStatsAccum.mKicks      += ps2vu1::GetKickCount();
+        {
+            uint64_t lf = 0, ls = 0; uint32_t ln = 0;
+            Ps2_GetLogCost(&lf, &ls, &ln);
+            sStatsAccum.mLogFileUs += lf;
+            sStatsAccum.mLogScrUs  += ls;
+            sStatsAccum.mLogLines  += ln;
+        }
+        if (sPrevFrameStartUs != 0 && sFrameStartUs > sPrevFrameStartUs)
+            sStatsAccum.mPeriodUs += (sFrameStartUs - sPrevFrameStartUs);
+        ps2vu1::ResetStats();
+        // EE work only — BeginFrame to the end of queue_exec, excluding the
+        // vblank sleep. This is the quantity the VU1 path is meant to reduce.
+        sStatsAccum.mDrawUs  += (sFrameStartUs != 0) ? (workEndUs - sFrameStartUs) : 0;
+        sStatsAccum.mWaitUs  += (nowUs > workEndUs) ? (nowUs - workEndUs) : 0;
+        ++sStatsFrames;
+
+        if (sStatsLastLogUs == 0) sStatsLastLogUs = nowUs;
+        if (nowUs - sStatsLastLogUs >= 1000000ull && sStatsFrames > 0)
+        {
+            // ONE line, not four. Each log line costs ~2.3 ms (a synchronous
+            // host: write plus a framebuffer render), all landing in a single
+            // frame -- four lines was a ~9 ms hitch once per second, clearly
+            // visible on hardware. Keep this a single emit.
+            uint32_t ioFiles = 0; uint64_t ioBytes = 0, ioUs = 0;
+            Ps2_GetIoStats(&ioFiles, &ioBytes, &ioUs);
+            uint32_t asub = 0, arej = 0, aund = 0;
+            Ps2_GetStreamStats(&asub, &arej, &aund);
+            LogDebug("[PS2] %s m%d | %u fps | period %llu = WORK %llu (mesh %llu [vif %llu, shade %llu, cull %llu, push %llu, seg %llu] "
+                     "+ tile %llu + rest %llu) + wait %llu + unacct %llu | tris V=%u E=%u C=%u VC=%u | %u kicks | %u texup | aud %us/%ur/%uu | io %uf %lluKB %llums | gsq %uKB | UI %llu us (%uq %ut %ug %up) | log %uL %llu us",
+                     sUseVu1Path ? "VU1" : "EE ",
+                     sBisectMode,
+                     (unsigned)sStatsFrames,
+                     (unsigned long long)(sStatsAccum.mPeriodUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mDrawUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mMeshUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mVifWaitUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mShadeUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mCullUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mPushUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mSegUs / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mVcUs / sStatsFrames),
+                     (unsigned long long)((sStatsAccum.mDrawUs - sStatsAccum.mMeshUs - sStatsAccum.mVcUs) / sStatsFrames),
+                     (unsigned long long)(sStatsAccum.mWaitUs / sStatsFrames),
+                     (unsigned long long)((sStatsAccum.mPeriodUs > sStatsAccum.mDrawUs + sStatsAccum.mWaitUs)
+                         ? (sStatsAccum.mPeriodUs - sStatsAccum.mDrawUs - sStatsAccum.mWaitUs) / sStatsFrames : 0),
+                     (unsigned)(sStatsAccum.mTrisVU1 / sStatsFrames),
+                     (unsigned)(sStatsAccum.mTrisEE / sStatsFrames),
+                     (unsigned)(sStatsAccum.mTrisCulled / sStatsFrames),
+                     (unsigned)(sStatsAccum.mTrisVC / sStatsFrames),
+                     (unsigned)(sStatsAccum.mKicks / sStatsFrames),
+                     (unsigned)(sStatsAccum.mTexUploads / sStatsFrames),
+                     asub, arej, aund,
+                     ioFiles, (unsigned long long)(ioBytes / 1024ull),
+                     (unsigned long long)(ioUs / 1000ull),
+                     (unsigned)(sStatsAccum.mGsQueuePeak / 1024u),
+                     (unsigned long long)(sStatsAccum.mUiUs   / sStatsFrames),
+                     (unsigned)(sStatsAccum.mQuads  / sStatsFrames),
+                     (unsigned)(sStatsAccum.mTexts  / sStatsFrames),
+                     (unsigned)(sStatsAccum.mGlyphs / sStatsFrames),
+                     (unsigned)(sStatsAccum.mPolys  / sStatsFrames),
+                     (unsigned)sStatsAccum.mLogLines,
+                     (unsigned long long)(sStatsAccum.mLogFileUs + sStatsAccum.mLogScrUs));
+#if PS2_PROFILE_BISECT
+            // Dwell 5 seconds per mode, not 1. Run-to-run spread is +/-3 ms and
+            // there is a periodic ~15 ms engine stall roughly every 6 s -- with
+            // six modes at 1 s each that stall aliased onto the same mode every
+            // cycle and poisoned it. Five samples per mode makes the spread
+            // visible instead of mistaking one sample for a result.
+            if (++sBisectDwell >= 5)
+            {
+                sBisectDwell = 0;
+                sBisectMode = (sBisectMode + 1) % 6;
+            }
+#endif
+            sStatsAccum = FrameStats{};
+            sStatsFrames = 0;
+            sStatsLastLogUs = nowUs;
+
+#if PS2_VU1_AB_MEASURE
+            // Alternate the two paths every second so one run yields an
+            // interleaved VU1/EE comparison on identical geometry — no rebuild,
+            // and no drift between runs to argue about. Toggled here, at a frame
+            // boundary, so a draw is never split across a mode change.
+            sUseVu1Path = !sUseVu1Path;
+#endif
+        }
+        sStats = FrameStats{};
+    }
+
     // Tell the texture manager we're starting a new frame — it bookkeeps
     // VRAM residency so cold textures get evicted before warm ones.
     gsKit_TexManager_nextFrame(sGsGlobal);
@@ -320,6 +687,24 @@ extern "C" void GFX_DrawTriangleDemo()
         GS_SETREG_RGBAQ(0xFF, 0x00, 0x00, 0x80, 0),
         GS_SETREG_RGBAQ(0x00, 0xFF, 0x00, 0x80, 0),
         GS_SETREG_RGBAQ(0x00, 0x00, 0xFF, 0x80, 0));
+}
+
+// Phase 1 VU1 proof-of-life. Call it right after GFX_DrawTriangleDemo from the
+// same debug hook: it draws the SAME triangle, offset 100px right and down, but
+// transformed and kicked by VU1 instead of by the EE.
+//
+// What a correct result looks like:
+//   * two gouraud triangles, identical in size and colour ramp, 100px apart
+//   * the gsKit one is NOT erased — proving the segment barriers keep the
+//     deferred gsKit_clear ordered ahead of the VU1 XGKICK
+//   * mGsFrameCounter keeps advancing — proving neither DMA channel hung
+extern "C" void GFX_DrawTriangleVU1Demo()
+{
+    if (sGsGlobal == nullptr || !ps2vu1::IsReady()) return;
+
+    ps2vu1::BeginSegment();          // flush gsKit, wait for the GIF channel
+    ps2vu1::DrawTriangleDemo(100.0f, 100.0f);
+    ps2vu1::EndSegment();            // wait for VIF1 + its PATH1 kick
 }
 
 // ----- Screen / view / pass — Phase 0-2 no-ops ----------------------------
@@ -565,12 +950,28 @@ void GFX_DestroyMaterialResource(Material* /*material*/) {}
 // path).
 namespace
 {
+    // One de-indexed triangle corner, laid out exactly as the VU1 push needs it.
+    //
+    // Why this exists: the per-frame cost of the VU1 path was ~430 cycles per
+    // vertex, which is far too slow for a few float copies. It is cache misses —
+    // de-indexing walks a std::vector<Vertex> (48 bytes each) in INDEX order, so
+    // nearly every read is a scattered fetch. Pre-flattening once per mesh turns
+    // the per-frame walk, and the cull's three-vertex reads, into sequential
+    // access. 24 bytes per corner; the index is kept so the per-frame vertex
+    // colour (which lighting changes every frame) can still be looked up.
+    using Vu1FlatVert = ps2vu1::FlatVert;
+
     struct Ps2MeshData
     {
         std::vector<Vertex>      mVertices;       // engine layout (pos/uv/uv/normal)
         std::vector<VertexColor> mVerticesColor;  // engine layout with vertex color
         std::vector<IndexType>   mIndices;
         bool                     mHasColor = false;
+        // Built lazily on first VU1 draw. Static geometry only — skeletal meshes
+        // re-skin every frame so their positions are never stable enough to cache.
+        // `mutable` — this is a derived cache, not state. The draw path holds
+        // Ps2MeshData by const ref and fills it on the first VU1 draw.
+        mutable std::vector<Vu1FlatVert> mVu1Flat;
     };
 
     // Maps engine StaticMesh* → our CPU geometry. Created in
@@ -965,6 +1366,7 @@ namespace
         const u32 g = (u32)(glm::clamp(c.g, 0.0f, 1.0f) * 255.0f);
         const u32 b = (u32)(glm::clamp(c.b, 0.0f, 1.0f) * 255.0f);
         u64* p = (u64*)gsKit_heap_alloc(sGsGlobal, 1, 16, GIF_AD);
+        ps2vu1::NoteGsKitWrite();
         *p++ = GIF_TAG_AD(1);
         *p++ = GIF_AD;
         *p++ = ((u64)r | ((u64)g << 8) | ((u64)b << 16));   // FOGCOL value
@@ -979,6 +1381,7 @@ namespace
     inline void WriteZWriteMask(int zmsk)
     {
         u64* p = (u64*)gsKit_heap_alloc(sGsGlobal, 1, 16, GIF_AD);
+        ps2vu1::NoteGsKitWrite();
         *p++ = GIF_TAG_AD(1);
         *p++ = GIF_AD;
         *p++ = GS_SETREG_ZBUF(sGsGlobal->ZBuffer / 8192, sGsGlobal->PSMZ, zmsk);
@@ -998,6 +1401,7 @@ namespace
         u64* p_store;
         u64* p_data;
         p_store = p_data = (u64*)gsKit_heap_alloc(sGsGlobal, 4, 64, kGifPrimTriGouraudFog);
+        ps2vu1::NoteGsKitWrite();
         if (p_store == (u64*)sGsGlobal->CurQueue->last_tag)
         {
             *p_data++ = GIF_TAG_TRIANGLE_GOURAUD(0);
@@ -1020,6 +1424,7 @@ namespace
         u64 c1, u64 c2, u64 c3)
     {
         gsKit_set_texfilter(sGsGlobal, tex->Filter);
+        ps2vu1::NoteGsKitWrite();
         const int tw = TexLog2(tex->Width);
         const int th = TexLog2(tex->Height);
 
@@ -1031,6 +1436,7 @@ namespace
         const int iu3 = gsKit_float_to_int_u(tex, u3), iv3 = gsKit_float_to_int_v(tex, v3);
 
         u64* p_data = (u64*)gsKit_heap_alloc(sGsGlobal, 6, 96, GSKIT_GIF_PRIM_TRIANGLE_TEXTURED);
+        ps2vu1::NoteGsKitWrite();
         *p_data++ = GIF_TAG_TRIANGLE_GORAUD_TEXTURED(0);
         *p_data++ = FogTexGouraudRegs(sGsGlobal->PrimContext);
         // TCC=1 (use TEXTURE alpha, not just RGB). Required for masked alpha-test
@@ -1058,6 +1464,86 @@ namespace
     }
 }
 
+// ----- VU1 geometry path --------------------------------------------------
+namespace
+{
+    // TEX0 for a bound GSTEXTURE. Factored out of PrimTriTexGouraudFog so the
+    // gsKit and VU1 paths cannot drift apart. TCC=1 (use texture alpha) matches
+    // that function: required for masked alpha-test cutouts, harmless otherwise.
+    inline u64 Ps2_MakeTex0(const GSTEXTURE* tex)
+    {
+        const int tw = TexLog2(tex->Width);
+        const int th = TexLog2(tex->Height);
+        if (tex->VramClut == 0)
+        {
+            return GS_SETREG_TEX0(tex->Vram / 256, tex->TBW, tex->PSM, tw, th,
+                1, sVcForceDecal ? 1 : 0, 0, 0, 0, 0, GS_CLUT_STOREMODE_NOLOAD);
+        }
+        return GS_SETREG_TEX0(tex->Vram / 256, tex->TBW, tex->PSM, tw, th,
+            1, 0, tex->VramClut / 256, tex->ClutPSM,
+            tex->ClutStorageMode, 0, GS_CLUT_STOREMODE_LOAD);
+    }
+
+    // The VU1 GIFtag carries only ST/RGBAQ/XYZF2, so TEX0 has to be live on the
+    // GS before the kick. Queue it through gsKit as an A+D — ps2vu1::BeginSegment
+    // does a queue_exec and waits for the GIF channel, so anything enqueued here
+    // lands before the VU1 primitives. Same idiom as WriteZWriteMask.
+    inline void WriteTex0(const GSTEXTURE* tex)
+    {
+        u64* p = (u64*)gsKit_heap_alloc(sGsGlobal, 1, 16, GIF_AD);
+        ps2vu1::NoteGsKitWrite();
+        *p++ = GIF_TAG_AD(1);
+        *p++ = GIF_AD;
+        *p++ = Ps2_MakeTex0(tex);
+        *p++ = GS_TEX0_1 + sGsGlobal->PrimContext;
+    }
+
+    // Lit vertex colour, split into the four 0..255 integers the microcode's
+    // preprocessing loop expects (it itof0's them, scales by colorScale, then
+    // ftoi0's back). Same overbright packing as PackModColor.
+    // Per-draw behaviour overrides, so TileMap2D / Terrain3D / Voxel3D can share
+    // DrawTrisHelper without inheriting the static-mesh defaults.
+    enum DrawFlags : uint32_t
+    {
+        kDrawNone       = 0,
+        kDrawNoCull     = 1u << 0,   // tiles are legitimately viewed from behind
+        // Forcing blend on this path produced a DARK, BURNT tilemap on
+        // hardware. Ps2_MakeTex0 sets TCC=1, so fragment alpha comes from the
+        // TEXEL, and the GS reads 128 as 1.0 - an opaque texel (alpha 255) is
+        // therefore As = 2.0, i.e. (Cs-Cd)*2+Cd, which over-saturates every
+        // pixel. Opaque tiles need no blending at all, so the tilemap does not
+        // use this. Kept for a layer that genuinely needs alpha, which will
+        // also need TCC/ALPHA set deliberately rather than inherited.
+        kDrawForceBlend = 1u << 1,
+        kDrawVcAlbedo   = 1u << 2,   // vertex colour IS the albedo, not a modulator
+        // Point-sample regardless of the asset's filter setting. A tile atlas
+        // is pixel art: bilinear samples the NEIGHBOURING tile's edge texels
+        // across every tile seam, which reads as soft and slightly dark.
+        //
+        // The old per-triangle path never called gsKit_set_texfilter at all, so
+        // it silently inherited whatever was last set - point, when the tilemap
+        // drew alone. That accident was the look we are restoring.
+        kDrawPointFilter = 1u << 3,
+    };
+
+    struct Vu1Color { u8 r, g, b, a; };
+    static_assert(sizeof(Vu1Color) == 4,
+                  "Vu1Color is handed to PushTriListFlat as packed RGBA8");
+    inline Vu1Color PackModColorRGBA(const glm::vec3& c, u32 alpha)
+    {
+        auto pk = [](float v) -> u8 { return (u8)glm::clamp((int)(v * 128.0f), 0, 255); };
+        return Vu1Color{ pk(c.r), pk(c.g), pk(c.b), (u8)alpha };
+    }
+
+    // Reused across draws so a per-mesh shade pass costs no allocation.
+    std::vector<Vu1Color> sVu1Colors;
+    // Which vertices survive backface culling, and the triangles that use them.
+    // Shading every vertex wastes ~half the work on a closed mesh, because
+    // roughly half the triangles are culled and their vertices are never sent.
+    std::vector<uint8_t>  sVu1Used;
+    std::vector<uint32_t> sVu1Tris;   // surviving triangle indices
+}
+
 // ----- Helper: transform + cull + submit a triangle-list mesh -------------
 // Used by static, instanced, and skeletal mesh draws — all three share the
 // same vertex→screen pipeline post-skinning/transforms.
@@ -1072,8 +1558,11 @@ namespace
                         bool unlit,
                         bool invertCull,
                         MaterialLite* mat = nullptr,
-                        const std::vector<VertexColor>* colorVerts = nullptr)
+                        const std::vector<VertexColor>* colorVerts = nullptr,
+                        std::vector<Vu1FlatVert>* vu1Flat = nullptr,
+                        uint32_t drawFlags = kDrawNone)
     {
+        if (sBisectMode == 1 || sBisectMode == 3) return;   // skip 3D meshes
         // Vertex source: either the plain Vertex vector (static/skeletal/instanced/
         // text) or a VertexColor vector (vertex-colored static meshes). hasColor
         // meshes were previously invisible because they populate mVerticesColor but
@@ -1082,6 +1571,16 @@ namespace
         const bool   hasColor = (colorVerts != nullptr);
         const size_t vcount   = hasColor ? colorVerts->size() : verts.size();
         if (sGsGlobal == nullptr || vcount == 0 || indices.empty()) return;
+
+        // Time the whole helper so we can tell renderer cost from the rest of
+        // the frame (Lua, physics, scene traversal). WORK alone cannot: it is
+        // the entire frame, and optimising the wrong half wastes effort.
+        const uint64_t meshT0 = SYS_GetTimeMicroseconds();
+        struct MeshTimer
+        {
+            uint64_t t0;
+            ~MeshTimer() { sStats.mMeshUs += SYS_GetTimeMicroseconds() - t0; }
+        } meshTimer{ meshT0 };
 
         auto vPos = [&](uint32_t i) -> glm::vec3 { return hasColor ? (*colorVerts)[i].mPosition  : verts[i].mPosition; };
         auto vNrm = [&](uint32_t i) -> glm::vec3 { return hasColor ? (*colorVerts)[i].mNormal    : verts[i].mNormal; };
@@ -1103,6 +1602,10 @@ namespace
             cull        = mat->GetCullMode();
             vcModulate  = (mat->GetVertexColorMode() != VertexColorMode::None) && hasColor;
         }
+        if ((drawFlags & kDrawVcAlbedo) != 0 && hasColor)
+        {
+            vcModulate = true;   // baked tile/voxel colour, regardless of material
+        }
         const bool  translucent = (blend == BlendMode::Translucent || blend == BlendMode::Additive);
         const bool  masked      = (blend == BlendMode::Masked);
         const float opacity     = (translucent && mat != nullptr) ? mat->GetOpacity() : 1.0f;
@@ -1115,12 +1618,13 @@ namespace
         //     cube "lighting flicker").
         const u32 alphaByte = translucent
             ? (u32)glm::clamp((int)(opacity * 128.0f), 0, 255)
-            : (masked ? 0x80u : 0xFFu);
+            : ((masked || (drawFlags & kDrawForceBlend) != 0) ? 0x80u : 0xFFu);
 
         // Blend enable (ABE bit in PRIM, read by gsKit AND our fog packets from
         // sGsGlobal->PrimAlphaEnable). Opaque/Masked stay unblended; the GS ALPHA
         // equation for translucent vs additive is selected below.
-        sGsGlobal->PrimAlphaEnable = translucent ? GS_SETTING_ON : GS_SETTING_OFF;
+        sGsGlobal->PrimAlphaEnable = (translucent || (drawFlags & kDrawForceBlend) != 0)
+                                   ? GS_SETTING_ON : GS_SETTING_OFF;
         if (translucent)
         {
             // Translucent: src-over (Cs-Cd)*As+Cd. Additive: Cs*As+Cd (B=0/"2", D=Cd).
@@ -1128,6 +1632,7 @@ namespace
                 ? GS_SETREG_ALPHA(0, 2, 0, 1, 0x80)   // Cs*As + Cd
                 : GS_SETREG_ALPHA(0, 1, 0, 1, 0x80);  // (Cs-Cd)*As + Cd
             gsKit_set_primalpha(sGsGlobal, alphaReg, 0);
+            ps2vu1::NoteGsKitWrite();
             // No depth writes for blended draws (they still depth-TEST against opaque)
             // — otherwise overlapping/back-to-front translucency self-occludes.
             WriteZWriteMask(1);
@@ -1144,6 +1649,7 @@ namespace
                 (int)((mat != nullptr ? mat->GetMaskCutoff() : 0.5f) * 255.0f), 0, 255);
             sGsGlobal->Test->AFAIL = 0;   // KEEP: a failed pixel updates nothing
             gsKit_set_test(sGsGlobal, GS_ATEST_ON);
+            ps2vu1::NoteGsKitWrite();
         }
 
         // Fog: enable the PRIM FGE bit for this draw (per-vertex F below) and set
@@ -1174,8 +1680,10 @@ namespace
         // active texture.
         if (texSlot != nullptr)
         {
-            gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
+            BindTex(&texSlot->mGsTex);
+            ps2vu1::NoteGsKitWrite();
             gsKit_set_clamp(sGsGlobal, texSlot->mClampMode);
+            ps2vu1::NoteGsKitWrite();
         }
         const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
         const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
@@ -1193,7 +1701,244 @@ namespace
             normalMat = glm::mat3(1.0f);
         }
 
-        const uint32_t numTris = (uint32_t)indices.size() / 3;
+        // ---- VU1 geometry path ------------------------------------------
+        // Transform, perspective divide and clipping move to VU1; lighting
+        // stays here on the EE, exactly as computed below, and is handed to the
+        // microcode as a finished vertex colour.
+        //
+        // Excluded for now, falling back to the EE loop:
+        //   fog         — the VU computes F itself but the EE version also
+        //                 supports an exponential ramp and a fog-alpha scale
+        //                 that the linear VU path has no equivalent for.
+        //   invertCull  — the skybox needs inverted winding AND horizon fog.
+        //   translucent — without backface culling the VU path would draw back
+        //                 faces, which changes a blended image (opaque meshes
+        //                 are unaffected: the depth test rejects them).
+        const bool useVu1 = sUseVu1Path && ps2vu1::IsReady()
+                         && !fog && !invertCull && !translucent;
+
+        if (useVu1)
+        {
+            // Shade once per UNIQUE vertex. The EE loop below recomputes
+            // lighting at every triangle corner, so in a closed mesh each
+            // vertex is lit ~6 times; a vertex stream removes that outright,
+            // which is a bigger saving than the transform itself.
+            // ---- Object-space backface cull ------------------------------
+            // VU1 has no culling of its own, so without this every back face
+            // reaches the GS — roughly double the triangles on a closed mesh,
+            // and fill rate is the scarcest resource on this hardware. Measured
+            // as ~7 ms/frame of extra GS time before this existed.
+            //
+            // The EE path culls on screen-space signed area, which needs the
+            // transform we just moved to VU1. Doing it in object space instead
+            // costs one 3x3 solve per mesh plus a cross and a dot per triangle,
+            // with no per-vertex work at all.
+            //
+            // The eye in object space is where the MVP's x, y and w rows all
+            // evaluate to zero — a projection sends the centre of projection to
+            // (0, 0, *, 0). Three equations, three unknowns.
+            bool cullEnabled = (cull != CullMode::None) && !invertCull &&
+                               ((drawFlags & kDrawNoCull) == 0);
+            glm::vec3 eyeObj(0.0f);
+            if (cullEnabled)
+            {
+                const glm::mat3 A(glm::vec3(mvp[0][0], mvp[0][1], mvp[0][3]),
+                                  glm::vec3(mvp[1][0], mvp[1][1], mvp[1][3]),
+                                  glm::vec3(mvp[2][0], mvp[2][1], mvp[2][3]));
+                const float detA = glm::determinant(A);
+                if (glm::abs(detA) > 1e-12f)
+                {
+                    eyeObj = glm::inverse(A) *
+                             glm::vec3(-mvp[3][0], -mvp[3][1], -mvp[3][3]);
+                }
+                else
+                {
+                    cullEnabled = false;   // degenerate matrix — draw everything
+                }
+            }
+            // A mirroring model matrix reverses visible winding, and the
+            // object-space test cannot see that on its own.
+            bool cullFlip = (cull == CullMode::Front);
+            if (glm::determinant(glm::mat3(model)) < 0.0f) cullFlip = !cullFlip;
+
+            // Walk the triangles ONCE up front: record which survive and mark the
+            // vertices they touch, so the shade pass below only lights vertices
+            // that will actually be sent. Also turns the later push into a walk
+            // over survivors instead of a re-test.
+            const uint32_t nTriAll = (uint32_t)(indices.size() / 3);
+            const uint64_t cullT0 = SYS_GetTimeMicroseconds();
+
+            // Flatten once per mesh. Positions and UVs never change for static
+            // geometry, so this is pure setup cost paid on the first draw.
+            if (vu1Flat != nullptr && vu1Flat->size() != (size_t)nTriAll * 3)
+            {
+                vu1Flat->resize((size_t)nTriAll * 3);
+                for (uint32_t k = 0; k < nTriAll * 3; ++k)
+                {
+                    const uint32_t idx = indices[k];
+                    const glm::vec3 p  = vPos(idx);
+                    const glm::vec2 uv = vUV(idx);
+                    Vu1FlatVert& f = (*vu1Flat)[k];
+                    f.mPos[0] = p.x; f.mPos[1] = p.y; f.mPos[2] = p.z;
+                    f.mUV[0]  = uv.x; f.mUV[1] = uv.y;
+                    f.mIndex  = idx;
+                }
+            }
+            const Vu1FlatVert* flat =
+                (vu1Flat != nullptr && vu1Flat->size() == (size_t)nTriAll * 3)
+                    ? vu1Flat->data() : nullptr;
+
+            sVu1Used.assign(vcount, 0);
+            sVu1Tris.clear();
+            sVu1Tris.reserve(nTriAll);
+            for (uint32_t t = 0; t < nTriAll; ++t)
+            {
+                uint32_t a, b, c;
+                glm::vec3 pa, pb, pc;
+                if (flat != nullptr)
+                {
+                    // Three CONTIGUOUS corners — one or two cache lines, versus
+                    // three scattered 48-byte Vertex fetches.
+                    const Vu1FlatVert* f = flat + t * 3;
+                    a = f[0].mIndex; b = f[1].mIndex; c = f[2].mIndex;
+                    pa = glm::vec3(f[0].mPos[0], f[0].mPos[1], f[0].mPos[2]);
+                    pb = glm::vec3(f[1].mPos[0], f[1].mPos[1], f[1].mPos[2]);
+                    pc = glm::vec3(f[2].mPos[0], f[2].mPos[1], f[2].mPos[2]);
+                }
+                else
+                {
+                    a = indices[t * 3 + 0];
+                    b = indices[t * 3 + 1];
+                    c = indices[t * 3 + 2];
+                    pa = vPos(a); pb = vPos(b); pc = vPos(c);
+                }
+
+                if (cullEnabled)
+                {
+                    const glm::vec3 n = glm::cross(pb - pa, pc - pa);
+                    float side = glm::dot(n, eyeObj - pa);
+                    if (cullFlip) side = -side;
+                    if (side <= 0.0f) continue;
+                }
+                sVu1Tris.push_back(t);
+                sVu1Used[a] = 1; sVu1Used[b] = 1; sVu1Used[c] = 1;
+            }
+
+            sStats.mCullUs += SYS_GetTimeMicroseconds() - cullT0;
+
+            const uint64_t shadeT0 = SYS_GetTimeMicroseconds();
+            sVu1Colors.resize(vcount);
+            for (size_t i = 0; i < vcount; ++i)
+            {
+                if (!sVu1Used[i]) continue;      // culled away — never sent
+                glm::vec3 lit(1.0f);
+                if (!unlit)
+                {
+                    const glm::vec3 nRaw = normalMat * vNrm((uint32_t)i);
+                    const float len2 = glm::dot(nRaw, nRaw);
+                    const glm::vec3 nWS = (len2 > 1e-12f) ? (nRaw / glm::sqrt(len2))
+                                                          : glm::vec3(0.0f, 1.0f, 0.0f);
+                    const glm::vec3 wPos = (light.mNumPoints > 0)
+                        ? glm::vec3(model * glm::vec4(vPos((uint32_t)i), 1.0f))
+                        : glm::vec3(0.0f);
+                    lit = ComputeLighting(nWS, wPos, light);
+                }
+                glm::vec3 modc = matTint * lit + matTint * matEmission;
+                if (vcModulate)
+                {
+                    // 0x80, not 0xFF, is identity here. The tile/voxel vertex
+                    // colour is stored in the GS overbright convention the rest
+                    // of this file uses (see UnpackVertexColor: it scales to
+                    // 0x80), but UnpackVertexColorRGB normalises by 255. Feeding
+                    // that to MODULATE (Cf = Ct*Cv>>7) gave Cv=64 for a white
+                    // tile and halved every texel -- the "dark tilemap".
+                    //
+                    // Established by flickering the options on hardware: ignoring
+                    // the vertex colour, doubling it, and DECAL all looked right
+                    // and all cancel exactly this factor. Doubling is the one
+                    // that still respects genuinely coloured tile art.
+                    const float scale = ((drawFlags & kDrawVcAlbedo) != 0)
+                                      ? (255.0f / 128.0f) : 1.0f;
+                    modc *= UnpackVertexColorRGB(vCol((uint32_t)i)) * scale;
+                }
+                sVu1Colors[i] = PackModColorRGBA(modc, alphaByte);
+            }
+            sStats.mShadeUs += SYS_GetTimeMicroseconds() - shadeT0;
+
+            // TEX0 must be live before the kick — the VU GIFtag only carries
+            // ST/RGBAQ/XYZF2. BeginSegment flushes this along with the blend /
+            // alpha-test / ZBUF state already queued above.
+            if (texSlot != nullptr)
+            {
+                gsKit_set_texfilter(sGsGlobal,
+                    ((drawFlags & kDrawPointFilter) != 0) ? GS_FILTER_NEAREST
+                                                          : texSlot->mGsTex.Filter);
+                ps2vu1::NoteGsKitWrite();
+                WriteTex0(&texSlot->mGsTex);
+            }
+
+            // FST=0: the VU emits ST+Q, so the GS interpolates texture
+            // coordinates perspective-correctly. The EE path uses FST=1 with
+            // screen-space UVs, which is the classic PS2 texture wobble.
+            const u32 prim = GS_SETREG_PRIM(GS_PRIM_PRIM_TRIANGLE,
+                                            1,                             // IIP gouraud
+                                            texSlot != nullptr ? 1 : 0,    // TME
+                                            GS_SETTING_OFF,                // FGE (fog excluded)
+                                            sGsGlobal->PrimAlphaEnable,
+                                            sGsGlobal->PrimAAEnable,
+                                            0,                             // FST: ST+Q
+                                            sGsGlobal->PrimContext, 0);
+
+            World* vw = GetWorld(0);
+            Camera3D* vc = vw ? vw->GetActiveCamera() : nullptr;
+            if (vc != nullptr) ps2vu1::SetNearFar(vc->GetNearZ(), vc->GetFarZ());
+            ps2vu1::SetModelViewProj(&mvp[0][0]);
+            ps2vu1::SetClipping(sVu1Clipping);
+
+            const uint64_t segT0 = SYS_GetTimeMicroseconds();
+            ps2vu1::BeginSegment();       // land everything gsKit has queued first
+            sStats.mSegUs += SYS_GetTimeMicroseconds() - segT0;
+
+            const uint64_t pushT0 = SYS_GetTimeMicroseconds();
+            ps2vu1::BeginTriList(prim);
+            // Survivors only — the cull already ran above, so this is a straight
+            // walk with no re-test and no second pass over dead triangles.
+            const uint32_t drawn = (uint32_t)sVu1Tris.size();
+            if (flat != nullptr)
+            {
+                // One call for the whole mesh instead of 3 per triangle.
+                ps2vu1::PushTriListFlat(flat, sVu1Tris.data(), drawn,
+                                        reinterpret_cast<const uint32_t*>(sVu1Colors.data()));
+            }
+            else
+            {
+                // Skeletal meshes re-skin every frame, so they have no flat
+                // cache and keep the per-vertex path.
+                for (uint32_t s = 0; s < drawn; ++s)
+                {
+                    const uint32_t base = sVu1Tris[s] * 3;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const uint32_t idx = indices[base + k];
+                        const glm::vec3 p  = vPos(idx);
+                        const glm::vec2 uv = vUV(idx);
+                        const Vu1Color  c  = sVu1Colors[idx];
+                        ps2vu1::PushVertex(p.x, p.y, p.z, uv.x, uv.y, c.r, c.g, c.b, c.a);
+                    }
+                }
+            }
+            ps2vu1::EndTriList();
+            sStats.mPushUs += SYS_GetTimeMicroseconds() - pushT0;
+            ps2vu1::EndSegment();         // drain VIF1 before gsKit draws again
+
+            sStats.mTrisVU1 += drawn;
+            sStats.mTrisCulled += (nTriAll - drawn);
+        }
+
+        // numTris is zero on the VU1 path, so the EE transform loop below is
+        // skipped wholesale while the state restore at the end still runs.
+        const uint32_t numTris = useVu1 ? 0u : (uint32_t)(indices.size() / 3);
+        sStats.mTrisEE += numTris;
         for (uint32_t t = 0; t < numTris; ++t)
         {
             const uint32_t i0 = indices[t * 3 + 0];
@@ -1364,6 +2109,7 @@ namespace
         if (translucent && blend == BlendMode::Additive)
         {
             gsKit_set_primalpha(sGsGlobal, GS_SETREG_ALPHA(0, 1, 0, 1, 0x80), 0);
+            ps2vu1::NoteGsKitWrite();
         }
         // Restore depth writes after a blended draw.
         if (translucent)
@@ -1374,9 +2120,97 @@ namespace
         if (masked)
         {
             gsKit_set_test(sGsGlobal, GS_ATEST_OFF);
+            ps2vu1::NoteGsKitWrite();
         }
     }
 }
+
+// ---- Phase 2 test mesh ------------------------------------------------------
+// Set to 0 to remove. Draws a rotating grid of lit cubes through the REAL
+// DrawTrisHelper path — same lighting, material handling, VU1 eligibility check
+// and submission the engine's own meshes use — so the VU1 path can be validated
+// and measured without depending on scene/asset loading.
+//
+// Each cube is a separate DrawTrisHelper call, which deliberately exercises the
+// per-mesh DMA barrier cost, not just raw triangle throughput.
+
+#if PS2_VU1_TESTMESH
+namespace
+{
+    constexpr int kTestGrid  = 6;                                   // 6x6 cubes
+    constexpr int kTestCubes = kTestGrid * kTestGrid;
+    // 24 verts (4 per face, so each face gets its own normal) / 36 indices.
+    std::vector<Vertex>    sTestVerts;
+    std::vector<IndexType> sTestIdx;
+    float                  sTestSpin = 0.0f;
+
+    void BuildTestCube()
+    {
+        if (!sTestVerts.empty()) return;
+        // +X -X +Y -Y +Z -Z
+        const glm::vec3 nrm[6] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        const glm::vec3 tan[6] = {{0,0,-1},{0,0,1},{1,0,0},{1,0,0},{1,0,0},{-1,0,0}};
+        const glm::vec3 bit[6] = {{0,1,0},{0,1,0},{0,0,-1},{0,0,1},{0,1,0},{0,1,0}};
+        for (int f = 0; f < 6; ++f)
+        {
+            const glm::vec3 c = nrm[f] * 0.5f;
+            const glm::vec2 uv[4] = {{0,0},{1,0},{1,1},{0,1}};
+            const float sx[4] = {-0.5f, 0.5f, 0.5f, -0.5f};
+            const float sy[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
+            for (int k = 0; k < 4; ++k)
+            {
+                Vertex v{};
+                v.mPosition  = c + tan[f] * sx[k] + bit[f] * sy[k];
+                v.mTexcoord0 = uv[k];
+                v.mNormal    = nrm[f];
+                sTestVerts.push_back(v);
+            }
+            const IndexType b = (IndexType)(f * 4);
+            sTestIdx.push_back(b); sTestIdx.push_back((IndexType)(b+1)); sTestIdx.push_back((IndexType)(b+2));
+            sTestIdx.push_back(b); sTestIdx.push_back((IndexType)(b+2)); sTestIdx.push_back((IndexType)(b+3));
+        }
+    }
+}
+
+extern "C" void GFX_DrawTestMesh()
+{
+    if (sGsGlobal == nullptr) return;
+    BuildTestCube();
+    sTestSpin += 0.01f;
+
+    // Fixed camera looking at the grid — independent of any scene camera, so
+    // the test renders identically whether or not a world is loaded.
+    const float aspect = (float)kViewportW / (float)kViewportH;
+    const glm::mat4 proj = glm::perspective(glm::radians(60.0f), aspect, 1.0f, 200.0f);
+    const glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 6.0f, 16.0f),
+                                       glm::vec3(0.0f, 0.0f, 0.0f),
+                                       glm::vec3(0.0f, 1.0f, 0.0f));
+    ps2vu1::SetNearFar(1.0f, 200.0f);
+
+    // One directional light so the Lambert path is actually exercised.
+    SceneLighting light{};
+    light.mAmbient   = glm::vec3(0.25f);
+    light.mHasDir    = true;
+    light.mDir       = glm::normalize(glm::vec3(-0.4f, -1.0f, -0.3f));
+    light.mDirColor  = glm::vec3(1.0f, 0.95f, 0.85f);
+    light.mNumPoints = 0;
+
+    for (int i = 0; i < kTestCubes; ++i)
+    {
+        const int   gx = i % kTestGrid;
+        const int   gz = i / kTestGrid;
+        const float px = (gx - (kTestGrid - 1) * 0.5f) * 2.2f;
+        const float pz = (gz - (kTestGrid - 1) * 0.5f) * 2.2f;
+
+        glm::mat4 model(1.0f);
+        model = glm::translate(model, glm::vec3(px, 0.0f, pz));
+        model = glm::rotate(model, sTestSpin + i * 0.3f, glm::vec3(0.3f, 1.0f, 0.1f));
+
+        DrawTrisHelper(sTestVerts, sTestIdx, model, proj * view * model,
+                       nullptr, light, /*unlit*/false, /*invertCull*/false);
+    }
+}
+#endif
 
 void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
 {
@@ -1407,7 +2241,7 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     // pass that as the color-vertex source so they draw (and can modulate color).
     const std::vector<VertexColor>* colorVerts = data.mHasColor ? &data.mVerticesColor : nullptr;
     DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light,
-                   wantUnlit, isSkybox, mat, colorVerts);
+                   wantUnlit, isSkybox, mat, colorVerts, &data.mVu1Flat);
 }
 
 // =========================================================================
@@ -1551,7 +2385,7 @@ void GFX_DrawInstancedMeshComp(InstancedMesh3D* comp)
         const glm::mat4 model = compTr * comp->CalculateInstanceTransform((int32_t)i);
         const glm::mat4 mvp   = vp * model;
         DrawTrisHelper(data.mVertices, data.mIndices, model, mvp, texSlot, light,
-                       unlit, /*invertCull=*/false, mat);
+                       unlit, /*invertCull=*/false, mat, nullptr, &data.mVu1Flat);
     }
 }
 
@@ -1639,6 +2473,10 @@ namespace
     {
         std::vector<VertexColor> mVerts;
         std::vector<IndexType>   mIndices;
+        // De-indexed VU1 stream. Unlike a static mesh this geometry CAN change
+        // without changing triangle count (edit a tile, same grid), so every
+        // Update path below must clear it -- size alone is not a valid key.
+        mutable std::vector<Vu1FlatVert> mVu1Flat;
     };
     std::unordered_map<TileMap2D*, Ps2VertexColorMesh> sTileMaps;
     std::unordered_map<Terrain3D*, Ps2VertexColorMesh> sTerrains;
@@ -1656,9 +2494,60 @@ namespace
                               const glm::mat4& model,
                               Ps2TextureData* texSlot,
                               const SceneLighting& light,
-                              MaterialLite* mat)
+                              MaterialLite* mat,
+                              bool forceUnlit = false)
     {
+        if (sBisectMode == 2 || sBisectMode == 3) return;   // skip tilemap/voxel
+
+        // Route through the VU1 pipeline instead of emitting one gsKit packet
+        // per triangle. Measured on hardware: the tilemap cost 7.8 ms of frame
+        // time with meshes present, 3.3 ms of which disappeared when the same
+        // 192 triangles were drawn untextured -- gsKit puts a TEX0 write in
+        // EVERY per-triangle packet, and a TEX0 write invalidates the GS
+        // texture cache even when the value is unchanged. Batching sets TEX0
+        // once per mesh and sends ~24 triangles per GIF packet.
+        //
+        // Flip to false to get the old per-triangle path back verbatim.
+        static const bool sVcUseSharedPath = true;
+        if (sVcUseSharedPath)
+        {
+            if (sGsGlobal == nullptr || data.mIndices.empty()) return;
+            World* w = GetWorld(0);
+            Camera3D* cam = (w != nullptr) ? w->GetActiveCamera() : nullptr;
+            if (cam == nullptr) return;
+
+            struct VcTimer2 {
+                uint64_t t0 = SYS_GetTimeMicroseconds();
+                ~VcTimer2() { sStats.mVcUs += SYS_GetTimeMicroseconds() - t0; }
+            } vcT;
+            sStats.mTrisVC += (uint32_t)(data.mIndices.size() / 3);
+
+            const glm::mat4 mvpVc = cam->GetViewProjectionMatrix() * model;
+            // TileMap2D is self-illuminated 2D art and passes forceUnlit. Deriving
+            // this from the material alone left it LIT whenever no material was
+            // overridden, which halved the tile brightness against the editor
+            // reference. Voxel3D/Terrain3D still light normally.
+            const bool unlitVc = (forceUnlit ||
+                (mat != nullptr && mat->GetShadingModel() == ShadingModel::Unlit));
+            static const std::vector<Vertex> kNoVerts;
+            DrawTrisHelper(kNoVerts, data.mIndices, model, mvpVc, texSlot, light,
+                           unlitVc, /*invertCull=*/false, mat, &data.mVerts,
+                           &data.mVu1Flat,
+                           kDrawNoCull | kDrawVcAlbedo | kDrawPointFilter);
+            return;
+        }
+
+        // Mode 5: same geometry, same fill, no texture -> isolates texel cost.
+        if (sBisectMode == 5) texSlot = nullptr;
         if (sGsGlobal == nullptr || data.mIndices.empty()) return;
+
+        // Until now this whole family (TileMap2D / Terrain3D / Voxel3D) was
+        // invisible in the profile — it fed neither counter, so its cost hid
+        // inside "rest of engine".
+        struct VcTimer {
+            uint64_t t0 = SYS_GetTimeMicroseconds();
+            ~VcTimer() { sStats.mVcUs += SYS_GetTimeMicroseconds() - t0; }
+        } vcTimer;
 
         World* world = GetWorld(0);
         if (world == nullptr) return;
@@ -1669,7 +2558,8 @@ namespace
         // Material state — unlit (TileMap) skips Lambert; tint/emissive apply as in
         // DrawTrisHelper. Voxel/Terrain are Lit so they now respond to the scene's
         // directional + point lights.
-        const bool unlit       = (mat != nullptr && mat->GetShadingModel() == ShadingModel::Unlit);
+        const bool unlit       = forceUnlit ||
+                                 (mat != nullptr && mat->GetShadingModel() == ShadingModel::Unlit);
         const glm::vec3 matTint = (mat != nullptr) ? glm::vec3(mat->GetColor()) : glm::vec3(1.0f);
         const float matEmission = (mat != nullptr) ? mat->GetEmission() : 0.0f;
         const bool needWP       = (light.mNumPoints > 0) && !unlit;
@@ -1677,7 +2567,9 @@ namespace
         glm::mat3 normalMat(model);
         if (!(normalMat[0][0] == normalMat[0][0])) normalMat = glm::mat3(1.0f);
 
-        sGsGlobal->PrimAlphaEnable = GS_SETTING_ON;
+        // Mode 4 tests whether this unconditional blend is what costs the GS:
+        // alpha blending makes every pixel a read-modify-write.
+        sGsGlobal->PrimAlphaEnable = (sBisectMode == 4) ? GS_SETTING_OFF : GS_SETTING_ON;
         const bool fog = sFog.mEnabled;
         sGsGlobal->PrimFogEnable = fog ? GS_SETTING_ON : GS_SETTING_OFF;
         if (fog)
@@ -1686,8 +2578,10 @@ namespace
         }
         if (texSlot != nullptr)
         {
-            gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
+            BindTex(&texSlot->mGsTex);
+            ps2vu1::NoteGsKitWrite();
             gsKit_set_clamp(sGsGlobal, texSlot->mClampMode);
+            ps2vu1::NoteGsKitWrite();
         }
         const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
         const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
@@ -1710,6 +2604,7 @@ namespace
         };
 
         const uint32_t numTris = (uint32_t)data.mIndices.size() / 3;
+        sStats.mTrisVC += numTris;
         for (uint32_t t = 0; t < numTris; ++t)
         {
             const uint32_t i0 = data.mIndices[t * 3 + 0];
@@ -1737,6 +2632,11 @@ namespace
             const int iz1 = (int)((1.0f - nz1) * 16383.5f);
             const int iz2 = (int)((1.0f - nz2) * 16383.5f);
 
+            // Screen-space area: the GS fill cost this draw represents.
+            {
+                const float ar = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+                sStats.mVcPixels += (uint32_t)((ar < 0.0f ? -ar : ar) * 0.5f);
+            }
             const int f0 = fog ? FogCoefficient(p0.w) : 255;
             const int f1 = fog ? FogCoefficient(p1.w) : 255;
             const int f2 = fog ? FogCoefficient(p2.w) : 255;
@@ -1816,6 +2716,7 @@ void GFX_UpdateVoxel3DResource(Voxel3D* v,
     auto& d = sVoxels[v];
     d.mVerts   = vertices;
     d.mIndices = indices;
+    d.mVu1Flat.clear();   // geometry changed -- size is not a valid cache key
 }
 void GFX_DrawVoxel3D(Voxel3D* v)
 {
@@ -1845,6 +2746,7 @@ void GFX_UpdateTerrain3DResource(Terrain3D* t,
     auto& d = sTerrains[t];
     d.mVerts   = vertices;
     d.mIndices = indices;
+    d.mVu1Flat.clear();   // geometry changed -- size is not a valid cache key
 }
 void GFX_DrawTerrain3D(Terrain3D* t)
 {
@@ -1887,6 +2789,7 @@ void GFX_UpdateTileMap2DResource(TileMap2D* tm,
     auto& d = sTileMaps[tm];
     d.mVerts   = vertices;
     d.mIndices = indices;
+    d.mVu1Flat.clear();   // geometry changed -- size is not a valid cache key
 }
 
 void GFX_DrawTileMap2D(TileMap2D* tm)
@@ -1896,7 +2799,7 @@ void GFX_DrawTileMap2D(TileMap2D* tm)
     if (it == sTileMaps.end()) return;
     DrawVertexColorMesh(it->second, tm->GetRenderTransform(),
                         GetVcMeshTexture(tm), GatherLighting(GetWorld(0)),
-                        ResolveMaterialLite(tm));
+                        ResolveMaterialLite(tm), /*forceUnlit=*/true);
 }
 
 // ----- Particles ----------------------------------------------------------
@@ -2001,8 +2904,10 @@ void GFX_DrawParticleComp(Particle3D* p)
 
     if (texSlot != nullptr)
     {
-        gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
+        BindTex(&texSlot->mGsTex);
+        ps2vu1::NoteGsKitWrite();
         gsKit_set_clamp(sGsGlobal, texSlot->mClampMode);
+        ps2vu1::NoteGsKitWrite();
     }
     const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
     const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
@@ -2160,8 +3065,10 @@ namespace
 
         if (texSlot != nullptr)
         {
-            gsKit_TexManager_bind(sGsGlobal, &texSlot->mGsTex);
+            BindTex(&texSlot->mGsTex);
+            ps2vu1::NoteGsKitWrite();
             gsKit_set_clamp(sGsGlobal, texSlot->mClampMode);
+            ps2vu1::NoteGsKitWrite();
         }
         const float texW = texSlot ? (float)texSlot->mGsTex.Width  : 1.0f;
         const float texH = texSlot ? (float)texSlot->mGsTex.Height : 1.0f;
@@ -2255,6 +3162,9 @@ void GFX_UpdateQuadResourceVertexData(Quad* /*q*/) {}
 
 void GFX_DrawQuad(Quad* quad)
 {
+    struct T { uint64_t t0 = SYS_GetTimeMicroseconds();
+               ~T() { sStats.mUiUs += SYS_GetTimeMicroseconds() - t0; } } t_;
+    ++sStats.mQuads;
     if (sGsGlobal == nullptr || quad == nullptr) return;
     VertexUI* verts = quad->GetVertices();
     const uint32_t n = quad->GetNumVertices();
@@ -2282,6 +3192,9 @@ void GFX_UpdateTextResourceVertexData(Text* /*t*/) {}
 
 void GFX_DrawText(Text* text)
 {
+    struct T { uint64_t t0 = SYS_GetTimeMicroseconds();
+               ~T() { sStats.mUiUs += SYS_GetTimeMicroseconds() - t0; } } t_;
+    ++sStats.mTexts;
     if (sGsGlobal == nullptr || text == nullptr) return;
     Font* font = text->GetFont();
     if (font == nullptr) return;
@@ -2290,6 +3203,32 @@ void GFX_DrawText(Text* text)
 
     const uint32_t numVisible = text->GetNumVisibleCharacters();
     if (numVisible == 0) return;
+    sStats.mGlyphs += numVisible;
+
+    // What is actually generating ~674 glyphs a frame? The console and stats
+    // overlay are both disabled, so these are real Text widgets. Dump every one
+    // of them a few seconds in, once, with its visible-character count and the
+    // string itself - the string is the part that says whether the count is
+    // honest or whether something is padding it.
+    {
+        static int      sTextDumpFrames = 0;
+        static bool     sTextDumped     = false;
+        static uint64_t sFirstUs        = 0;
+        if (!sTextDumped)
+        {
+            const uint64_t now = SYS_GetTimeMicroseconds();
+            if (sFirstUs == 0) sFirstUs = now;
+            // ~8 s in, by which point the count has plateaued.
+            if (now - sFirstUs > 8000000ull)
+            {
+                if (++sTextDumpFrames > 20) sTextDumped = true;   // one frame's worth
+                const std::string& str = text->GetText();
+                LogDebug("[PS2] TEXT #%d: %u glyphs, strlen=%u, size=%.1f, text='%.40s'",
+                         sTextDumpFrames, (unsigned)numVisible,
+                         (unsigned)str.size(), text->GetTextSize(), str.c_str());
+            }
+        }
+    }
     const uint32_t numVerts = numVisible * TEXT_VERTS_PER_CHAR;
     VertexUI* verts = text->GetVertices();
     if (verts == nullptr) return;
@@ -2318,6 +3257,9 @@ void GFX_UpdatePolyResourceVertexData(Poly* /*p*/) {}
 
 void GFX_DrawPoly(Poly* poly)
 {
+    struct T { uint64_t t0 = SYS_GetTimeMicroseconds();
+               ~T() { sStats.mUiUs += SYS_GetTimeMicroseconds() - t0; } } t_;
+    ++sStats.mPolys;
     if (sGsGlobal == nullptr || poly == nullptr) return;
     VertexUI* verts = poly->GetVertices();
     const uint32_t n = poly->GetNumVertices();

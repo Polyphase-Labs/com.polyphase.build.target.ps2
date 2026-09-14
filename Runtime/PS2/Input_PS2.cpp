@@ -118,7 +118,10 @@ void INP_Shutdown()
     InputShutdown();
 }
 
-void INP_Update()
+// Measured at ~35 us/frame on hardware, so libpad's vblank-synchronised SIO2
+// transfer is NOT a source of frame-time jitter here — worth recording, because
+// it is the obvious suspect for a stall outside the renderer's timing window.
+static void INP_UpdateImpl()
 {
     InputAdvanceFrame();
 
@@ -132,8 +135,17 @@ void INP_Update()
     InputState& input = GetEngineState()->mInput;
     GamepadState& gp = input.mGamepads[0];
 
-    if (padGetState(kPadPort, kPadSlot) != PAD_STATE_STABLE)
+    const int padState = padGetState(kPadPort, kPadSlot);
+    if (padState != PAD_STATE_STABLE)
     {
+        // Trace state changes only - logging every frame would cost ~5.8 ms a
+        // line on a memory card and drown the frame.
+        static int sLastBadState = -1;
+        if (padState != sLastBadState)
+        {
+            sLastBadState = padState;
+            LogWarning("Input_PS2: pad not STABLE (state=%d) - input ignored", padState);
+        }
         gp.mConnected = false;
         return;
     }
@@ -141,11 +153,40 @@ void INP_Update()
 
     padButtonStatus data;
     const int ret = padRead(kPadPort, kPadSlot, &data);
-    if (ret == 0) return;
+    if (ret == 0)
+    {
+        static bool sReportedReadFail = false;
+        if (!sReportedReadFail)
+        {
+            sReportedReadFail = true;
+            LogWarning("Input_PS2: padRead returned 0 - no data from the pad");
+        }
+        return;
+    }
 
     // libpad returns `btns` as inverted bitmask (pressed = 0). Invert
     // so a set bit means "button held" — matches the rest of the engine.
     const uint16_t b = (uint16_t)(0xffff ^ data.btns);
+
+    // Report the pad on its first successful read, then only when the held
+    // buttons change. Idle costs nothing; a press produces exactly one line, so
+    // this is safe even where a log line is expensive (mmce0:).
+    {
+        static uint16_t sPrevButtons = 0;
+        static bool     sReportedFirst = false;
+        if (!sReportedFirst)
+        {
+            sReportedFirst = true;
+            LogDebug("Input_PS2: first read OK (mode=%d btns=0x%04X) - pad is being polled",
+                     padInfoMode(kPadPort, kPadSlot, PAD_MODECURID, 0), (unsigned)b);
+        }
+        if (b != sPrevButtons)
+        {
+            sPrevButtons = b;
+            LogDebug("Input_PS2: buttons=0x%04X lx=%u ly=%u", (unsigned)b,
+                     (unsigned)data.ljoy_h, (unsigned)data.ljoy_v);
+        }
+    }
 
     // Face buttons — Xbox-position mapping (A=bottom, B=right, X=left, Y=top).
     gp.mButtons[GAMEPAD_A] = (b & PAD_CROSS)    ? 1 : 0;
@@ -202,6 +243,13 @@ void INP_Update()
 
     InputPostUpdate();
 }
+
+void INP_Update()
+{
+    INP_UpdateImpl();
+}
+
+
 
 // PS2 doesn't surface cursor / mouse / soft-keyboard concepts the engine knows
 // about. Symbols required for link.
