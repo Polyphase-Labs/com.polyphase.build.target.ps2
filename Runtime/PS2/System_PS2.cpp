@@ -93,6 +93,92 @@ void Ps2_SyncDCacheRange(void* p, size_t n)
     if (p != nullptr && n != 0) SyncDCache(p, (char*)p + n);
 }
 
+// ---- Direct disc reads for the content pak ----------------------------------
+// On a disc boot the pak is read with sceCdRead, the path every retail game
+// uses and the one a loader like OPL is exercised on hardest, instead of
+// fread() over the fileio RPC. The fileio path returned wrong bytes for the
+// pak header or index on roughly half of hardware boots (2026-09-13), while a
+// probe doing the same reads was always right; whatever the interaction is,
+// libcdvd sidesteps it: one RPC per request, data DMA'd straight to a 64-byte
+// aligned buffer, completion waited on with sceCdSync. Returns false when not
+// booted from a disc or on any error, and the caller falls back to fread.
+// `offset` must be sector-aligned; `bytes` is capped to the file.
+extern bool SYS_PS2_IsBootDeviceKnown();
+extern const char* SYS_PS2_GetBootDevice();
+void Ps2_SifLock();
+void Ps2_SifUnlock();
+
+bool Ps2_DiscReadRange(const char* path, uint32_t offset, uint32_t bytes, void* dst, uint32_t* got)
+{
+    if (got != nullptr) *got = 0;
+    if (path == nullptr || dst == nullptr || bytes == 0) return false;
+    if (!SYS_PS2_IsBootDeviceKnown() || strncmp(SYS_PS2_GetBootDevice(), "cdrom", 5) != 0) return false;
+    if ((offset % 2048u) != 0 || (((uintptr_t)dst) & 63u) != 0) return false;
+
+    // Locate once per path. sceCdSearchFile wants "\DIR\FILE.EXT;1".
+    static char     sLocPath[128] = {0};
+    static uint32_t sLocLsn  = 0;
+    static uint32_t sLocSize = 0;
+    static bool     sLocOk   = false;
+    if (!sLocOk || strncmp(sLocPath, path, sizeof(sLocPath) - 1) != 0)
+    {
+        const char* iso = strchr(path, ':');
+        iso = (iso != nullptr) ? iso + 1 : path;
+        char isoPath[128];
+        snprintf(isoPath, sizeof(isoPath), "%s%s", (iso[0] == '\\' || iso[0] == '/') ? "" : "\\", iso);
+        for (char* c = isoPath; *c; ++c) if (*c == '/') *c = '\\';
+
+        sceCdlFILE f;
+        memset(&f, 0, sizeof(f));
+        Ps2_SifLock();
+        const int found = sceCdSearchFile(&f, isoPath);
+        Ps2_SifUnlock();
+        if (found == 0 || f.size == 0)
+        {
+            static bool sSaid = false;
+            if (!sSaid) { scr_printf("[cdread] sceCdSearchFile failed for %s\n", isoPath); sSaid = true; }
+            sLocOk = false;
+            return false;
+        }
+        strncpy(sLocPath, path, sizeof(sLocPath) - 1);
+        sLocPath[sizeof(sLocPath) - 1] = '\0';
+        sLocLsn  = f.lsn;
+        sLocSize = f.size;
+        sLocOk   = true;
+    }
+
+    if (offset >= sLocSize) return false;
+    uint32_t want = bytes;
+    if (want > sLocSize - offset) want = sLocSize - offset;
+    const uint32_t sectors = (want + 2047u) / 2048u;
+
+    sceCdRMode mode;
+    mode.trycount    = 0;
+    mode.spindlctrl  = SCECdSpinNom;
+    mode.datapattern = SCECdSecS2048;
+    mode.pad         = 0;
+
+    Ps2_SifLock();
+    int started = 0;
+    for (int tries = 0; tries < 16 && started == 0; ++tries)
+    {
+        started = sceCdRead(sLocLsn + offset / 2048u, sectors, dst, &mode);
+    }
+    int err = -1;
+    if (started != 0)
+    {
+        sceCdSync(0);
+        err = sceCdGetError();
+    }
+    Ps2_SifUnlock();
+    if (started == 0 || err != SCECdErNO) return false;
+
+    // DMA landed in RAM behind the cache's back.
+    SyncDCache(dst, (char*)dst + sectors * 2048u);
+    if (got != nullptr) *got = want;
+    return true;
+}
+
 void Ps2_SifLock()   { if (sSifSema >= 0) WaitSema(sSifSema); }
 void Ps2_SifUnlock() { if (sSifSema >= 0) SignalSema(sSifSema); }
 
