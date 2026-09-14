@@ -60,6 +60,7 @@ extern "C" unsigned int  size_mmcedrv_irx;
 #include "Engine.h"
 #include "Engine/Renderer.h"   // Renderer::EnableConsole
 extern void Ps2_LogHeap(const char* tag);   // System_PS2.cpp
+extern bool Ps2_IsFileLogDead();            // System_PS2.cpp
 #include "Engine/Profiler.h"   // stall attribution
 #include <algorithm>
 #include "EmbeddedFile.h"
@@ -133,10 +134,18 @@ void OctPostInitialize()
     //
     // Re-enable from Lua with Renderer.EnableConsole(true) when you want to read
     // logs on a console with no ps2link attached.
-    if (Renderer::Get() != nullptr)
+    //
+    // Unless there is no file log at all (no ps2link, card unusable): then the
+    // console is the only place the engine's own errors can be read, so it
+    // stays up and pays its 4.7 ms.
+    if (Renderer::Get() != nullptr && !Ps2_IsFileLogDead())
     {
         Renderer::Get()->EnableConsole(false);
         LogDebug("[PS2] on-screen console disabled (Renderer.EnableConsole(true) re-enables)");
+    }
+    else if (Renderer::Get() != nullptr)
+    {
+        LogWarning("[PS2] no file log available - on-screen console left enabled");
     }
 }
 
@@ -430,6 +439,20 @@ int main(int argc, char** argv)
     //
     // All best-effort: a console with no MMCE device simply finds no hardware,
     // which must not stop boot.
+    //
+    // NOT on a disc boot. Under OPL the IOP belongs to the loader, and when
+    // the ISO lives on an MMCE card OPL's own driver is already talking to it
+    // over SIO2. Pushing a second iomanX/mmceman/mmcedrv stack on top and
+    // calling fileXioInit hijacks that bus, and cdrom0: reads stop returning
+    // after this point — the ELF boots, then every asset open fails. A disc
+    // build never needs mmce0: anyway: saves go to mc0:.
+    const bool discBoot = SYS_PS2_IsBootDeviceKnown() &&
+                          (strncmp(SYS_PS2_GetBootDevice(), "cdrom", 5) == 0);
+    if (discBoot)
+    {
+        scr_printf("[2c] MMCE: skipped (booted from %s)\n", SYS_PS2_GetBootDevice());
+    }
+    else
     {
         int dummy = 0;
         const int iomanxRet  = SifExecModuleBuffer(

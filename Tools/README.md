@@ -128,6 +128,15 @@ escape hatch that depends on nothing.
 
 ## ps2deploy — running on the console without ps2link
 
+> **Superseded (2026-09-12).** The package step now does this itself. In the PS2
+> profile's Target Options: *Copy to device root* copies the finished disc
+> layout (Content.pak, Config.ini, SYSTEM.CNF, `<DISCID>.ELF`, `<project>/`,
+> `Engine/`) to a drive or folder, and *HDD install (hdl_svr IP)* runs
+> `hdl_dump delete` + `inject_cd` against a console running hdl_svr (one UAC
+> prompt on Windows; hdl_dump demands elevation). Make ISO is on by default and
+> the profile is held at Embedded off / Static Content on / Content Pak on.
+> The script below still works for a loose-file (non-pak) tree.
+
 ```powershell
 .\ps2deploy.ps1                 # stage into Build\PS2\Deploy
 .\ps2deploy.ps1 -Dest E:\      # and copy to the card/stick

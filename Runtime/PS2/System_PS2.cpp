@@ -34,6 +34,7 @@
 #include <unistd.h>       // sbrk - heap high-water reporting
 #include <timer.h>
 #include <debug.h>          // scr_printf
+#include <errno.h>
 #include <delaythread.h>    // DelayThread
 #include <unistd.h>         // rmdir, etc.
 #include <libmc.h>          // mcOpen/mcRead/mcWrite/mcSync — memory card I/O
@@ -80,6 +81,18 @@ void Ps2_SifLockInit()
     sSifSema = CreateSema(&s);
     if (sSifSema < 0) LogError("Ps2_SifLockInit: CreateSema failed (%d)", sSifSema);
 }
+// After a DMA read into ordinary (cached) memory the EE data cache may still
+// hold the buffer's PREVIOUS contents, and the unaligned head/tail bytes that
+// ps2sdk's fio copies with the CPU sit in it as dirty lines. Write back and
+// invalidate the range before the CPU reads it: dirty lines land in RAM, stale
+// lines are dropped, and what the CPU then sees is what the IOP delivered.
+// Established on hardware 2026-09-13: pak reads decoded correctly only when a
+// print between the fread and the copy happened to evict the lines.
+void Ps2_SyncDCacheRange(void* p, size_t n)
+{
+    if (p != nullptr && n != 0) SyncDCache(p, (char*)p + n);
+}
+
 void Ps2_SifLock()   { if (sSifSema >= 0) WaitSema(sSifSema); }
 void Ps2_SifUnlock() { if (sSifSema >= 0) SignalSema(sSifSema); }
 
@@ -456,6 +469,31 @@ void SYS_PS2_InitBootFilesystem()
     // Config.ini sits at the root of every packaged build, so finding it proves
     // the device works AND that the content is actually there.
     //
+    // A disc boot is handled FIRST and on its own. Every loader that starts an
+    // ISO — the BIOS, PCSX2, OPL from HDD/USB/SMB/MMCE — passes
+    // "cdrom0:\<ID>.ELF;1" in argv[0], and cdvdman resolves only the
+    // backslash/UPPERCASE/";1" form, so the generic two-form probe below can
+    // never succeed on it. Before this special case the probe fell through to
+    // the card and USB candidates, and any mmce0:/mass: root still carrying a
+    // loose ps2deploy tree silently became the boot device: the ISO booted,
+    // then loaded stale files off the card and never read the disc again.
+    if (sBootDeviceKnown && sBootIsCdrom)
+    {
+        sceCdInit(CDVD_INIT_INIT);
+        char path[96];
+        snprintf(path, sizeof(path), "%s\\CONFIG.INI;1", sBootDevice);
+        FILE* f = fopen(path, "rb");
+        scr_printf("[1c]   try %-28s %s\n", path, (f != nullptr) ? "OK" : "-");
+        if (f != nullptr) fclose(f);
+        // Either way we stay on the disc: argv said that is where the content
+        // is, and switching to whatever else has a Config.ini is exactly the
+        // silent-wrong-content failure this exists to prevent.
+        sBootNeedsSlash = false;    // the cdrom path is rebuilt separately
+        scr_printf("[1c] boot device %s %s\n", sBootDevice,
+                   (f != nullptr) ? "confirmed (disc)" : "named by argv but CONFIG.INI missing - staying on disc");
+        return;
+    }
+
     // argv[0] alone is not enough: it gave the right device here (mmce0:) while
     // the path SEPARATOR was wrong, and every open failed silently - a black
     // screen rendering an empty world. Hence probing both forms.
@@ -463,6 +501,14 @@ void SYS_PS2_InitBootFilesystem()
     {
         scr_printf("[1c] boot device %s confirmed (slash=%d)\n",
                    sBootDevice, sBootNeedsSlash ? 1 : 0);
+        return;
+    }
+    if (sBootDeviceKnown)
+    {
+        // A named device with no Config.ini on it. Say so and stay put rather
+        // than adopting some other device that happens to carry one.
+        scr_printf("[1c] %s named by argv but Config.ini missing - staying on it\n", sBootDevice);
+        sBootNeedsSlash = (strncmp(sBootDevice, "host:", 5) != 0);
         return;
     }
 
@@ -787,6 +833,7 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
         if (++guard > 8192) { LogError("[PS2] read loop stuck on '%s'", resolved); break; }
     }
     Ps2_SifLock(); fclose(f); Ps2_SifUnlock();
+    Ps2_SyncDCacheRange(outData, total);
     sIoBytes += total;
     sIoUs    += SYS_GetTimeMicroseconds() - ioT0;
 
@@ -1632,6 +1679,16 @@ static bool     sLogToScreen = true;
 // the open on every single line -- harmless on host:, ruinous on cdrom0:,
 // where a disc build has no host: file to open at all.
 static bool     sLogOpenTried = false;
+// Memory-card commit. MCMAN writes a file's length into its directory entry
+// only when the handle is CLOSED, so a log held open for the whole run reads
+// as 0 bytes from a browser no matter how much was written (seen on hardware:
+// a full session, 0 B on the card). For mc0:/mc1: paths the file is therefore
+// closed and reopened in append mode every couple of seconds, and immediately
+// after a warning or error line. Each reopen is a few ms of mcman work,
+// invisible at that cadence; SD/USB devices commit on write and are left alone.
+static bool     sLogIsMemCard  = false;
+static uint64_t sLogLastCommit = 0;
+static int      sLogCardFails  = 0;
 
 void Ps2_SetLogToScreen(bool enable)
 {
@@ -1647,6 +1704,14 @@ void Ps2_SetLogToScreen(bool enable)
     sLogToScreen = enable;
 }
 
+// True once the file sink has been tried and is not available: nothing on the
+// card, no host:, or the card died. Main_PS2 leaves the on-screen console up in
+// that case so a disc boot is never completely blind.
+bool Ps2_IsFileLogDead()
+{
+    return sLogOpenTried && sLogFile == nullptr;
+}
+
 void Ps2_GetLogCost(uint64_t* fileUs, uint64_t* scrUs, uint32_t* lines)
 {
     if (fileUs != nullptr) *fileUs = sLogFileUs;
@@ -1659,6 +1724,25 @@ void Ps2_AppendLogLineRaw(const char* line)
 {
     if (line == nullptr) return;
 
+    // Boot-tty mirror FIRST. A card write that never returns (seen on hardware:
+    // a MemCard PRO switching images mid-run) would otherwise swallow the very
+    // line that says what was happening. ~0.6 ms per line, only until the
+    // renderer owns the screen.
+    if (sLogToScreen)
+    {
+        const uint64_t sT0 = SYS_GetTimeMicroseconds();
+        scr_printf("%s\n", line);
+        sLogScrUs += SYS_GetTimeMicroseconds() - sT0;
+    }
+
+    if (sLogFile == nullptr && !sLogOpenTried && !GetEngineConfig()->mLogToFile)
+    {
+        // Config.ini LogToFile=0: screen only. The one switch that takes the
+        // memory card out of the boot path entirely.
+        sLogOpenTried = true;
+        scr_printf("[1b] log -> (LogToFile=0: screen only)\n");
+    }
+
     if (sLogFile == nullptr && !sLogOpenTried)
     {
         sLogOpenTried = true;
@@ -1667,9 +1751,33 @@ void Ps2_AppendLogLineRaw(const char* line)
         const char* dev = SYS_PS2_IsBootDeviceKnown() ? SYS_PS2_GetBootDevice() : "host:";
         if (strncmp(dev, "cdrom", 5) == 0)
         {
-            // A disc is read-only. Try the memory card so a disc build still
-            // leaves evidence behind.
-            snprintf(sLogFilePath, sizeof(sLogFilePath), "mc0:/ps2-addon.log");
+            // A disc is read-only. PCSX2 keeps its host: HLE alive during an
+            // ISO boot (root = the ISO's folder), which is a complete, readable
+            // log for free; on hardware the open fails at once. Otherwise the
+            // memory card, so a disc build still leaves evidence behind.
+            snprintf(sLogFilePath, sizeof(sLogFilePath), "host:ps2-addon.log");
+            sLogFile = fopen(sLogFilePath, "w");
+            if (sLogFile == nullptr)
+            {
+#if defined(PS2_CARD_LOG)
+                snprintf(sLogFilePath, sizeof(sLogFilePath), "mc0:/ps2-addon.log");
+#else
+                // NOT the memory card. Established on hardware 2026-09-13 with
+                // byte-identical ELFs: when the log had been opened and written
+                // on mc0: before ContentPak mounted, the pak's index read came
+                // back corrupt every time (checksum mismatch, 3/3 retries); with
+                // the card untouched the same image booted to the scene. The
+                // drive reads themselves were proven correct with a sector-hash
+                // probe, so the damage is an IOP-side interaction between the
+                // memory-card write and the loader's disc read that is not
+                // understood yet. Until it is, a disc boot logs to the screen
+                // (the on-screen console stays up when there is no file sink).
+                // Build with -DPS2_CARD_LOG to experiment.
+                sLogOpenTried = true;
+                scr_printf("[1b] log -> screen only (disc boot; memory-card log disabled, see System_PS2.cpp)\n");
+                return;
+#endif
+            }
         }
         else if (strncmp(dev, "host:", 5) == 0)
         {
@@ -1681,14 +1789,44 @@ void Ps2_AppendLogLineRaw(const char* line)
         }
         // Open with "w" on first use — truncate stale logs from prior runs
         // so a fresh launch doesn't append to a 100 MB file.
-        sLogFile = fopen(sLogFilePath, "w");
-        scr_printf("[1b] log -> %s  (%s)\n", sLogFilePath,
-                   (sLogFile != nullptr) ? "open" : "FAILED - screen only");
+        if (sLogFile == nullptr) sLogFile = fopen(sLogFilePath, "w");
+        if (sLogFile != nullptr)
+            scr_printf("[1b] log -> %s  (open)\n", sLogFilePath);
+        else
+            scr_printf("[1b] log -> %s  FAILED errno=%d - screen only\n", sLogFilePath, errno);
         if (sLogFile != nullptr)
         {
             // Default newlib stdio uses full buffering; line buffer instead
             // so tailing the file while the game runs shows live progress.
             setvbuf(sLogFile, nullptr, _IOLBF, 0);
+            sLogIsMemCard  = (strncmp(sLogFilePath, "mc", 2) == 0);
+            sLogLastCommit = SYS_GetTimeMicroseconds();
+        }
+        if (sLogFile != nullptr && sLogIsMemCard)
+        {
+            // Prove the card can take a write and hand it back. A card whose
+            // handle dies on the first write (a MemCard PRO switching images
+            // once the loader sends the game ID) otherwise costs a slow, failing
+            // mcman round-trip on every one of the thousand lines a boot logs -
+            // which on hardware looked like a game that never finished loading.
+            const bool wrote = (fputs("[log] card probe\n", sLogFile) >= 0) && (fflush(sLogFile) == 0);
+            fclose(sLogFile);
+            sLogFile = nullptr;
+            bool readBack = false;
+            if (wrote)
+            {
+                FILE* chk = fopen(sLogFilePath, "r");
+                if (chk != nullptr) { readBack = (fgetc(chk) == '['); fclose(chk); }
+            }
+            if (readBack)
+            {
+                sLogFile = fopen(sLogFilePath, "a");
+                if (sLogFile != nullptr) { setvbuf(sLogFile, nullptr, _IOLBF, 0); fseek(sLogFile, 0, SEEK_END); }
+            }
+            if (sLogFile == nullptr)
+            {
+                scr_printf("[1b] card log unusable (probe %s) - not retrying\n", wrote ? "read-back failed" : "write failed");
+            }
         }
         else
         {
@@ -1703,18 +1841,53 @@ void Ps2_AppendLogLineRaw(const char* line)
     {
         const uint64_t fT0 = SYS_GetTimeMicroseconds();
         fputs(line, sLogFile);
-        fputc('\n', sLogFile);
+        const bool writeFailed = (fputc('\n', sLogFile) == EOF) || ferror(sLogFile);
+        if (sLogIsMemCard)
+        {
+            // MCMAN facts that shape this block (ps2sdk iop/memorycard/mcman):
+            //   * the directory entry's length is written only by close;
+            //   * O_APPEND is ignored, so a reopen lands at offset 0 and must
+            //     be followed by an explicit seek to the end;
+            //   * 0x400 (O_TRUNC) is a creation attribute, not truncation;
+            //   * a card-change event (a MemCard PRO / SD2PSX switching to its
+            //     per-title image after the loader sends the game ID) makes
+            //     every open handle fail with DeniedPermit from then on.
+            // So: commit on a timer and after any warning/error, and when a
+            // write fails treat the handle as dead and open a fresh one on
+            // whatever card is present now.
+            const uint64_t now    = SYS_GetTimeMicroseconds();
+            const bool     urgent = (line[0] == '[' && (line[1] == 'E' || line[1] == 'W'));
+            if (writeFailed && ++sLogCardFails > 2)
+            {
+                // Three dead writes in a row: the card is gone. Stop paying for
+                // it - every further attempt is a slow mcman failure.
+                fclose(sLogFile);
+                sLogFile = nullptr;
+                return;
+            }
+            if (!writeFailed) sLogCardFails = 0;
+            if (writeFailed || urgent || now - sLogLastCommit >= 2000000ull)
+            {
+                fclose(sLogFile);
+                sLogFile = fopen(sLogFilePath, "a");
+                if (sLogFile != nullptr)
+                {
+                    setvbuf(sLogFile, nullptr, _IOLBF, 0);
+                    fseek(sLogFile, 0, SEEK_END);
+                    if (writeFailed)
+                    {
+                        fputs("[W] [PS2] card log handle died (card changed?) - reopened\n", sLogFile);
+                        fputs(line, sLogFile);
+                        fputc('\n', sLogFile);
+                    }
+                }
+                sLogLastCommit = now;
+            }
+        }
         // Don't fflush on every line — _IOLBF already flushes on '\n'.
         sLogFileUs += SYS_GetTimeMicroseconds() - fT0;
     }
 
-    // Boot-tty mirror so very-early-boot crashes leave on-screen evidence.
-    if (sLogToScreen)
-    {
-        const uint64_t sT0 = SYS_GetTimeMicroseconds();
-        scr_printf("%s\n", line);
-        sLogScrUs += SYS_GetTimeMicroseconds() - sT0;
-    }
     ++sLogLines;
 }
 
